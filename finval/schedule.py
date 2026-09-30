@@ -8,12 +8,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import TYPE_CHECKING
+from typing import Any
 
-from .conventions import is_month_end, shift_months, year_fraction
-
-if TYPE_CHECKING:
-    from .contract import FixedRateContract
+from .conventions import Frequency, is_month_end, shift_months, year_fraction
 
 
 @dataclass(frozen=True)
@@ -26,21 +23,28 @@ class Cashflow:
     accrual_factor: float
     interest_amount: float
     notional_amount: float
+    fixing_date: date | None = None
+    reference_rate: float | None = None
+    rate_source: str = "FIXED"       # FIXED / FIXING / FORECAST
 
     @property
     def amount(self) -> float:
         return self.interest_amount + self.notional_amount
 
 
-def _unadjusted_anchors(contract: "FixedRateContract") -> list[date]:
+def _unadjusted_anchors(
+    start: date,
+    end: date,
+    frequency: Frequency,
+    eom: bool,
+    stub: StubType,
+) -> list[date]:
     """返回含起息日、不含到期日的理论周期日列表，并处理残期。"""
-    start, end = contract.start_date, contract.end_date
-    step = contract.frequency.months
-    stub = contract.stub
+    step = frequency.months
 
     if stub.value.endswith("FIRST"):
         # 从到期日倒推
-        snap = contract.eom
+        snap = eom
         anchors = [end]
         while True:
             earlier = shift_months(anchors[0], -step, snap_eom=snap)
@@ -60,7 +64,7 @@ def _unadjusted_anchors(contract: "FixedRateContract") -> list[date]:
         return [start] + anchors[:-1]      # SHORT_FIRST
 
     if stub.value.endswith("LAST"):
-        snap = contract.eom
+        snap = eom
         anchors = [start]
         while True:
             later = shift_months(anchors[-1], step, snap_eom=snap)
@@ -76,27 +80,52 @@ def _unadjusted_anchors(contract: "FixedRateContract") -> list[date]:
     # NONE：必须恰好为完整周期
     regular = [start]
     while regular[-1] < end:
-        regular.append(shift_months(regular[-1], step, snap_eom=contract.eom))
+        regular.append(shift_months(regular[-1], step, snap_eom=eom))
     if regular[-1] != end:
         raise ValueError("起息日与到期日不是完整付息周期，请指定残期类型")
     return regular[:-1]
 
 
+def build_period_dates(
+    start: date,
+    end: date,
+    frequency: Frequency,
+    eom: bool,
+    stub: StubType,
+    calendar: Any,
+    bdc: Any,
+    payment_lag_business_days: int = 0,
+) -> list[tuple[date, date, date, date]]:
+    """返回每段 (计息起, 计息止(调整后), 理论周期日, 支付日)。"""
+    anchors = _unadjusted_anchors(start, end, frequency, eom, stub)
+    period_ends = anchors[1:] + [end]
+    periods = []
+    adj_start = calendar.adjust(anchors[0], bdc)
+    for unadj_end in period_ends:
+        adj_end = calendar.adjust(unadj_end, bdc)
+        if payment_lag_business_days:
+            payment_date = calendar.shift_business_days(
+                adj_end, payment_lag_business_days)
+        else:
+            payment_date = adj_end
+        periods.append((adj_start, adj_end, unadj_end, payment_date))
+        adj_start = adj_end
+    return periods
+
+
 def generate_schedule(contract: "FixedRateContract") -> tuple[Cashflow, ...]:
     """生成逐笔现金流；返回不可变元组，后续曲线变动不会修改它。"""
-    anchors = _unadjusted_anchors(contract)
-    cal, bdc = contract.calendar, contract.business_day_convention
-    end = contract.end_date
+    periods = build_period_dates(
+        contract.start_date, contract.end_date, contract.frequency,
+        contract.eom, contract.stub, contract.calendar,
+        contract.business_day_convention)
 
-    period_ends = anchors[1:] + [end]
     cashflows = []
-    adj_start = cal.adjust(anchors[0], bdc)
-    for i, unadj_end in enumerate(period_ends, start=1):
-        adj_end = cal.adjust(unadj_end, bdc)
+    for i, (adj_start, adj_end, unadj_end, payment_date) in enumerate(periods, start=1):
         factor = year_fraction(adj_start, adj_end, contract.day_count)
         redemption = (
             contract.notional
-            if contract.notional_exchange and unadj_end == end
+            if contract.notional_exchange and unadj_end == contract.end_date
             else 0.0
         )
         cashflows.append(Cashflow(
@@ -104,11 +133,11 @@ def generate_schedule(contract: "FixedRateContract") -> tuple[Cashflow, ...]:
             accrual_start=adj_start,
             accrual_end=adj_end,
             unadjusted_end=unadj_end,
-            payment_date=adj_end,
+            payment_date=payment_date,
             accrual_factor=factor,
-            interest_amount=round(
-                contract.notional * contract.fixed_rate * factor, 6),
+            interest_amount=round(contract.notional * contract.fixed_rate * factor, 6),
             notional_amount=redemption,
+            reference_rate=contract.fixed_rate,
+            rate_source="FIXED",
         ))
-        adj_start = adj_end
     return tuple(cashflows)

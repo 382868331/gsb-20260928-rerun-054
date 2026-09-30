@@ -50,3 +50,14 @@ class Calendar:
     def add_holidays(self, dates) -> "Calendar":
         self.holidays.update(dates)
         return self
+
+    def shift_business_days(self, d: date, offset: int) -> date:
+        """按营业日平移 offset 个工作日；offset 为负时向前取，落点始终为营业日。"""
+        step_days = timedelta(days=1 if offset >= 0 else -1)
+        target = abs(offset)
+        moved = 0
+        while moved < target:
+            d = d + step_days
+            if self.is_business_day(d):
+                moved += 1
+        return d

@@ -50,6 +50,25 @@ class DiscountCurve:
         t = (d - x0).days / (x1 - x0).days
         return math.exp(math.log(y0) + t * (math.log(y1) - math.log(y0)))
 
+    def zero_rate(self, d: date) -> float:
+        """连续复利年化零息利率：-ln(DF(t)) / ACT/365 年。"""
+        if d <= self.valuation_date:
+            raise ValueError("零息利率期限必须晚于曲线估值日")
+        return -math.log(self.discount_factor(d)) / (
+            (d - self.valuation_date).days / 365.0)
+
+    def forward_rate(self, start: date, end: date) -> float:
+        """[start, end) 上的连续复利远期利率（按实际天数/365 年化）。"""
+        if start < self.valuation_date:
+            raise ValueError("远期利率起点不得早于曲线估值日")
+        if end <= start:
+            raise ValueError("远期利率终点必须晚于起点")
+        log_df_start = (
+            0.0 if start == self.valuation_date
+            else math.log(self.discount_factor(start)))
+        log_df_end = math.log(self.discount_factor(end))
+        return (log_df_start - log_df_end) / ((end - start).days / 365.0)
+
     def parallel_shift(self, spread: float) -> "DiscountCurve":
         """整体平移零息利率（连续复利），返回新曲线，原曲线不变。"""
         new_dfs = tuple(
@@ -57,6 +76,23 @@ class DiscountCurve:
             for pd, df in zip(self.pillar_dates, self.discount_factors)
         )
         return DiscountCurve(
+            curve_id=f"{self.curve_id}_shift{spread:g}",
+            valuation_date=self.valuation_date,
+            pillar_dates=self.pillar_dates,
+            discount_factors=new_dfs,
+        )
+
+
+@dataclass(frozen=True)
+class ForecastCurve(DiscountCurve):
+    """浮动利率预测曲线；可独立于贴现曲线平移，历史定盘不经过本曲线。"""
+
+    def parallel_shift(self, spread: float) -> "ForecastCurve":
+        new_dfs = tuple(
+            df * math.exp(-spread * (pd - self.valuation_date).days / 365.0)
+            for pd, df in zip(self.pillar_dates, self.discount_factors)
+        )
+        return ForecastCurve(
             curve_id=f"{self.curve_id}_shift{spread:g}",
             valuation_date=self.valuation_date,
             pillar_dates=self.pillar_dates,
