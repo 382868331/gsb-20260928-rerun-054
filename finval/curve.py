@@ -62,3 +62,14 @@ class DiscountCurve:
             pillar_dates=self.pillar_dates,
             discount_factors=new_dfs,
         )
+
+    def forward_rate(self, start: date, end: date, day_count: object) -> float:
+        """由贴现因子推导 [start, end) 的简单复利远期利率。"""
+        from .conventions import year_fraction
+
+        tau = year_fraction(start, end, day_count)
+        if tau <= 0:
+            raise ValueError("远期利率区间必须严格为正")
+        df_start = self.discount_factor(start)
+        df_end = self.discount_factor(end)
+        return (df_start / df_end - 1.0) / tau

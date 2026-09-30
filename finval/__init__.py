@@ -3,9 +3,10 @@
 from .calendar import Calendar, BusinessDayConvention
 from .conventions import DayCount, Frequency, UnsupportedConventionError
 from .contract import FixedRateContract, StubType
-from .schedule import Cashflow, generate_schedule
+from .floating import FloatingRateContract, MissingFixingError
+from .schedule import Cashflow, generate_floating_schedule, generate_schedule
 from .curve import DiscountCurve
-from .valuation import Valuation, ValuationBatch
+from .valuation import CashflowExplanation, Valuation, ValuationBatch, value_floating_contract
 
 __all__ = [
     "Calendar",
@@ -14,10 +15,15 @@ __all__ = [
     "Frequency",
     "UnsupportedConventionError",
     "FixedRateContract",
+    "FloatingRateContract",
     "StubType",
+    "MissingFixingError",
     "Cashflow",
+    "CashflowExplanation",
     "generate_schedule",
+    "generate_floating_schedule",
     "DiscountCurve",
+    "value_floating_contract",
     "Valuation",
     "ValuationBatch",
 ]

@@ -47,6 +47,14 @@ class Calendar:
             d = d - timedelta(days=1)
         return d
 
+    def subtract_business_days(self, d: date, n: int) -> date:
+        """返回 d 之前第 n 个营业日（d 本身不计入）。"""
+        while n > 0:
+            d = d - timedelta(days=1)
+            if self.is_business_day(d):
+                n -= 1
+        return d
+
     def add_holidays(self, dates) -> "Calendar":
         self.holidays.update(dates)
         return self

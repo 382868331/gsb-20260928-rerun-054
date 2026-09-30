@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from .conventions import is_month_end, shift_months, year_fraction
 
@@ -24,11 +24,16 @@ class Cashflow:
     unadjusted_end: date
     payment_date: date
     accrual_factor: float
-    interest_amount: float
+    interest_amount: Optional[float]
     notional_amount: float
+    rate: Optional[float] = None              # 已定盘/固定利率；未定盘为 None
+    fixing_date: Optional[date] = None
+    rate_source: str = "FIXED_CONTRACT"       # FIXED_CONTRACT / FIXING / FORECAST
 
     @property
-    def amount(self) -> float:
+    def amount(self) -> Optional[float]:
+        if self.interest_amount is None:
+            return None
         return self.interest_amount + self.notional_amount
 
 
@@ -82,17 +87,28 @@ def _unadjusted_anchors(contract: "FixedRateContract") -> list[date]:
     return regular[:-1]
 
 
+def _build_periods(contract) -> tuple[list[date], list[date], list[date]]:
+    """返回（理论锚点、每期理论止日、营业日调整后的起止边界）。"""
+    anchors = _unadjusted_anchors(contract)
+    end = contract.end_date
+    period_ends = anchors[1:] + [end]
+    boundaries = []
+    cal, bdc = contract.calendar, contract.business_day_convention
+    adj_start = cal.adjust(anchors[0], bdc)
+    for unadj_end in period_ends:
+        adj_end = cal.adjust(unadj_end, bdc)
+        boundaries.append((adj_start, adj_end))
+        adj_start = adj_end
+    return anchors, period_ends, boundaries
+
+
 def generate_schedule(contract: "FixedRateContract") -> tuple[Cashflow, ...]:
     """生成逐笔现金流；返回不可变元组，后续曲线变动不会修改它。"""
-    anchors = _unadjusted_anchors(contract)
-    cal, bdc = contract.calendar, contract.business_day_convention
+    anchors, period_ends, boundaries = _build_periods(contract)
     end = contract.end_date
-
-    period_ends = anchors[1:] + [end]
     cashflows = []
-    adj_start = cal.adjust(anchors[0], bdc)
-    for i, unadj_end in enumerate(period_ends, start=1):
-        adj_end = cal.adjust(unadj_end, bdc)
+    for i, (unadj_end, (adj_start, adj_end)) in enumerate(
+            zip(period_ends, boundaries), start=1):
         factor = year_fraction(adj_start, adj_end, contract.day_count)
         redemption = (
             contract.notional
@@ -109,6 +125,51 @@ def generate_schedule(contract: "FixedRateContract") -> tuple[Cashflow, ...]:
             interest_amount=round(
                 contract.notional * contract.fixed_rate * factor, 6),
             notional_amount=redemption,
+            rate=contract.fixed_rate,
+            fixing_date=None,
+            rate_source="FIXED_CONTRACT",
         ))
-        adj_start = adj_end
+    return tuple(cashflows)
+
+
+def generate_floating_schedule(contract) -> tuple[Cashflow, ...]:
+    """生成浮动利率逐笔现金流。
+
+    已有定盘值的期间利息在日程中固定；尚未定盘期间 interest_amount 为 None，
+    必须在估值时由预测曲线给出，且估值记录单独保存预测结果。
+    """
+    anchors, period_ends, boundaries = _build_periods(contract)
+    end = contract.end_date
+    cashflows = []
+    for i, (unadj_end, (adj_start, adj_end)) in enumerate(
+            zip(period_ends, boundaries), start=1):
+        factor = year_fraction(adj_start, adj_end, contract.day_count)
+        fixing_date = contract.fixing_date(adj_start)
+        known = contract.known_fixing(fixing_date)
+        if known is not None:
+            rate = known + contract.spread
+            interest = round(contract.notional * rate * factor, 6)
+            source = "FIXING"
+        else:
+            rate = None
+            interest = None
+            source = "FORECAST"
+        redemption = (
+            contract.notional
+            if contract.notional_exchange and unadj_end == end
+            else 0.0
+        )
+        cashflows.append(Cashflow(
+            index=i,
+            accrual_start=adj_start,
+            accrual_end=adj_end,
+            unadjusted_end=unadj_end,
+            payment_date=adj_end,
+            accrual_factor=factor,
+            interest_amount=interest,
+            notional_amount=redemption,
+            rate=rate,
+            fixing_date=fixing_date,
+            rate_source=source,
+        ))
     return tuple(cashflows)
