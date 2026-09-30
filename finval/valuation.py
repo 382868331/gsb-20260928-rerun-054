@@ -31,6 +31,9 @@ class CashflowExplanation:
     amount: float
     discount_factor: Optional[float]
     present_value: float
+    payment_state: str = ""           # FIXED / PENDING / PAID / CANCELLED / ADJUSTED
+    basis: str = ""                   # 生效依据，可追溯到定盘/更正/终止事件
+    outstanding_notional: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -71,13 +74,25 @@ def _discount_and_explain(
         interest = cf.interest_amount
 
         if cf.rate_source == "FIXING":
-            fixing_value = contract.known_fixing(cf.fixing_date)
+            # 已支付的期间冻结在支付日实际使用的定盘值；
+            # 支付日之后才到达的更正不改动已支付金额，差额由调整款项体现。
+            fix_as_of = min(valuation_date, cf.payment_date)
+            fixing_value, _ = contract.effective_fixing(cf.fixing_date, fix_as_of)
             if fixing_value is None:
                 raise MissingFixingError(
                     f"{contract.contract_id} 第 {cf.index} 期定盘日 {cf.fixing_date} "
                     f"缺少已知定盘值，不能使用预测曲线替代")
+            if cf.payment_date <= valuation_date and not cf.cancelled:
+                from .schedule import _weighted_interest
 
-        if cf.rate_source == "FORECAST":
+                rate = fixing_value + spread
+                interest = _weighted_interest(
+                    cf.segments, rate, contract.day_count)
+
+        if cf.cancelled and interest is None:
+            interest = 0.0
+
+        if cf.rate_source == "FORECAST" and not cf.cancelled:
             # 定盘日已到/已过却没有历史值：明确报错，绝不静默预测。
             if cf.fixing_date <= valuation_date:
                 raise MissingFixingError(
@@ -96,7 +111,11 @@ def _discount_and_explain(
 
         amount = interest + cf.notional_amount
 
-        if cf.payment_date <= valuation_date:
+        if cf.cancelled:
+            status = "CANCELLED"
+            df = None
+            pv = 0.0
+        elif cf.payment_date <= valuation_date:
             status = "PAID"
             df = None
             pv = 0.0
@@ -104,6 +123,17 @@ def _discount_and_explain(
             status = "FUTURE"
             df = curve.discount_factor(cf.payment_date)
             pv = round(amount * df, 6)
+
+        if cf.cancelled:
+            payment_state = "CANCELLED"
+        elif cf.rate_source == "ADJUSTMENT":
+            payment_state = "ADJUSTED"
+        elif status == "PAID":
+            payment_state = "PAID"
+        elif cf.rate_source in ("FIXED_CONTRACT", "FIXING"):
+            payment_state = "FIXED"
+        else:
+            payment_state = "PENDING"
 
         dfs.append(df)
         pvs.append(pv)
@@ -123,6 +153,9 @@ def _discount_and_explain(
             amount=amount,
             discount_factor=df,
             present_value=pv,
+            payment_state=payment_state,
+            basis=cf.basis,
+            outstanding_notional=cf.outstanding_notional,
         ))
 
     return Valuation(
@@ -143,13 +176,69 @@ def value_contract(
     forecast_curve: Optional[DiscountCurve] = None,
 ) -> Valuation:
     """用指定曲线估值合约；每次调用都保留独立日程快照。"""
-    cashflows = generate_schedule(contract)
+    cashflows = generate_schedule(contract, as_of=curve.valuation_date)
     return _discount_and_explain(
         contract=contract,
         cashflows=cashflows,
         curve=curve,
         forecast_curve=forecast_curve,
     )
+
+
+def _correction_adjustments(
+    contract: FloatingRateContract,
+    cashflows: tuple[Cashflow, ...],
+    valuation_date: date,
+) -> tuple[Cashflow, ...]:
+    """为“支付日后才到达”的定盘更正生成调整款项。
+
+    已支付金额保持原样，绝不重算成另一笔实际支付；
+    差额作为独立的 ADJUSTMENT 现金流，在下一个未付支付日结算。
+    """
+    from .schedule import _weighted_interest
+
+    extra = []
+    future_payments = sorted(
+        {cf.payment_date for cf in cashflows if cf.payment_date > valuation_date})
+    for cf in cashflows:
+        if cf.rate_source != "FIXING" or cf.payment_date > valuation_date:
+            continue
+        paid_value, _ = contract.effective_fixing(
+            cf.fixing_date, as_of=cf.payment_date)
+        now_value, correction = contract.effective_fixing(
+            cf.fixing_date, as_of=valuation_date)
+        if correction is None or paid_value == now_value:
+            continue
+        paid_interest = _weighted_interest(
+            cf.segments, paid_value + contract.spread, contract.day_count)
+        diff = round(cf.interest_amount - paid_interest, 6)
+        if diff == 0:
+            continue
+        if future_payments:
+            pay_date = future_payments[0]
+        else:
+            pay_date = contract.calendar.adjust(
+                correction.notice_date, contract.business_day_convention)
+        ref = correction.reference or correction.notice_date
+        extra.append(Cashflow(
+            index=1000 + cf.index,
+            accrual_start=cf.accrual_start,
+            accrual_end=cf.accrual_end,
+            unadjusted_end=cf.unadjusted_end,
+            payment_date=pay_date,
+            accrual_factor=cf.accrual_factor,
+            interest_amount=diff,
+            notional_amount=0.0,
+            rate=None,
+            fixing_date=cf.fixing_date,
+            rate_source="ADJUSTMENT",
+            outstanding_notional=cf.outstanding_notional,
+            cancelled=False,
+            basis=(f"ADJUSTMENT for CORRECTION[{ref}] fixing {cf.fixing_date}: "
+                   f"paid {paid_value} -> corrected {now_value}"),
+            segments=cf.segments,
+        ))
+    return tuple(extra)
 
 
 def value_floating_contract(
@@ -158,13 +247,55 @@ def value_floating_contract(
     forecast_curve: Optional[DiscountCurve] = None,
 ) -> Valuation:
     """估值浮动利率合约：历史定盘金额固定，未来定盘仅来自预测曲线。"""
-    cashflows = generate_floating_schedule(contract)
+    cashflows = generate_floating_schedule(contract, as_of=curve.valuation_date)
+    cashflows = cashflows + _correction_adjustments(
+        contract, cashflows, curve.valuation_date)
     return _discount_and_explain(
         contract=contract,
         cashflows=cashflows,
         curve=curve,
         forecast_curve=forecast_curve,
     )
+
+
+@dataclass(frozen=True)
+class ScheduleDiff:
+    """两次估值间单笔现金流的差异，可追溯到生效依据。"""
+
+    index: int
+    change: str          # UNCHANGED / CORRECTED / REDUCED / CANCELLED /
+                         # ADJUSTMENT_ADDED / AMOUNT_CHANGED
+    before_amount: Optional[float]
+    after_amount: Optional[float]
+    basis: str
+
+
+def compare_schedules(before: Valuation, after: Valuation) -> tuple[ScheduleDiff, ...]:
+    """对照更正/终止前后的日程快照，逐笔给出差异与依据。"""
+    before_map = {e.index: e for e in before.explanations}
+    diffs = []
+    for e in after.explanations:
+        b = before_map.get(e.index)
+        if b is None:
+            diffs.append(ScheduleDiff(
+                index=e.index, change="ADJUSTMENT_ADDED",
+                before_amount=None, after_amount=e.amount, basis=e.basis))
+            continue
+        if e.payment_state == "CANCELLED" and b.payment_state != "CANCELLED":
+            change = "CANCELLED"
+        elif e.amount != b.amount and "CORRECTION" in e.basis:
+            change = "CORRECTED"
+        elif (e.outstanding_notional is not None
+              and e.outstanding_notional != b.outstanding_notional):
+            change = "REDUCED"
+        elif e.amount != b.amount:
+            change = "AMOUNT_CHANGED"
+        else:
+            change = "UNCHANGED"
+        diffs.append(ScheduleDiff(
+            index=e.index, change=change,
+            before_amount=b.amount, after_amount=e.amount, basis=e.basis))
+    return tuple(diffs)
 
 
 class ValuationBatch:
@@ -196,3 +327,16 @@ class ValuationBatch:
             if v.contract_id == contract_id and v.curve_id == curve_id:
                 return v
         raise KeyError(f"批次中不存在 {contract_id} @ {curve_id}")
+
+    def save(self, path) -> None:
+        """把批次（含全部估值记录与日程快照）保存为 JSON。"""
+        from .persistence import save_batch
+
+        save_batch(self, path)
+
+    @classmethod
+    def load(cls, path) -> "ValuationBatch":
+        """从 JSON 恢复批次；旧日程快照与历史结论保持可查，可继续估值。"""
+        from .persistence import load_batch
+
+        return load_batch(path)

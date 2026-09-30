@@ -18,6 +18,11 @@
 - **历史定盘保护**：定盘日不晚于估值日却缺少定盘值时抛出 `MissingFixingError`，预测曲线永远不会悄悄替代已发生的定盘。
 - **预测曲线**：仅定盘日晚于估值日的期间使用预测曲线推导简单复利远期利率；预测曲线可与贴现曲线不同。
 - **逐笔解释**：每条 `Valuation` 保存 `explanations`，说明该笔是 `FIXING`（含定盘日/定盘值）还是 `FORECAST`（含预测曲线与远期区间），支付日已过的期间标记为 `PAID` 且不参与 NPV。
+- **历史定盘更正**：`FixingCorrection` 带到达日 `notice_date`；到达之前的估值仍使用当时资料，到达之后只影响相关现金流。支付日后才到达的更改正不动已支付金额，差额生成独立的 `ADJUSTMENT` 调整款项，在下一个未付支付日结算。
+- **部分提前终止**：`PartialTermination` 生效日按合约营业日约定调整后切分计息期，期内分段按剩余本金计息；恰好落在周期边界上时前一完整周期按终止前本金全额计息；恰好落在定盘日时定盘照常生效、本金自计息起按剩余计。本金全额终止后的期次标记 `CANCELLED`，金额为 0、不参与 NPV。
+- **支付状态**：每笔解释带 `payment_state`（`FIXED` 已固定 / `PENDING` 待定 / `PAID` 已支付 / `CANCELLED` 取消 / `ADJUSTED` 调整款项）与 `basis`（生效依据，可追溯到定盘、更正公告或终止通知）。
+- **日程对照**：`compare_schedules(before, after)` 逐笔给出 `UNCHANGED / CORRECTED / REDUCED / CANCELLED / ADJUSTMENT_ADDED / AMOUNT_CHANGED` 差异及依据。
+- **持久化**：`ValuationBatch.save(path)` / `ValuationBatch.load(path)` 以 JSON 保存全部估值记录与日程快照；重开后旧快照与历史结论保持可查，可继续估值且不覆盖旧记录。
 
 ## 用法
 

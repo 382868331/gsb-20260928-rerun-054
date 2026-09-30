@@ -9,6 +9,7 @@ from typing import Mapping
 from .calendar import BusinessDayConvention, Calendar
 from .conventions import DayCount, Frequency, UnsupportedConventionError
 from .contract import StubType
+from .events import FixingCorrection, PartialTermination
 
 
 class MissingFixingError(ValueError):
@@ -35,6 +36,8 @@ class FloatingRateContract:
     fixing_lag_business_days: int = 2  # 定盘日相对计息起息日的营业日滞后
     spread: float = 0.0                # 加点（年化，简单加到定盘/远期利率上）
     fixings: Mapping[date, float] = field(default_factory=dict)
+    fixing_corrections: tuple = ()     # 历史定盘更正事件
+    partial_terminations: tuple = ()   # 已发生的部分提前终止事件
 
     def __post_init__(self) -> None:
         if not isinstance(self.day_count, DayCount):
@@ -56,6 +59,10 @@ class FloatingRateContract:
         if self.calendar is None:
             object.__setattr__(self, "calendar", Calendar())
         object.__setattr__(self, "fixings", dict(self.fixings or {}))
+        object.__setattr__(
+            self, "fixing_corrections", tuple(self.fixing_corrections or ()))
+        object.__setattr__(
+            self, "partial_terminations", tuple(self.partial_terminations or ()))
 
     def fixing_date(self, accrual_start: date) -> date:
         """计息期定盘日：计息起息日往前推 fixing_lag_business_days 个营业日。"""
@@ -64,3 +71,20 @@ class FloatingRateContract:
 
     def known_fixing(self, fixing_date: date) -> float | None:
         return self.fixings.get(fixing_date)
+
+    def effective_fixing(self, fixing_date: date, as_of: date | None = None):
+        """返回 (定盘值, 应用的更正或 None)。
+
+        as_of 之前的估值只看 notice_date <= as_of 的更正；
+        as_of 为 None 时应用全部已知更正。多个更正按 notice_date 后者优先。
+        """
+        value = self.fixings.get(fixing_date)
+        applied = None
+        for c in sorted(self.fixing_corrections, key=lambda c: c.notice_date):
+            if c.fixing_date != fixing_date:
+                continue
+            if as_of is not None and c.notice_date > as_of:
+                continue
+            value = c.corrected_value
+            applied = c
+        return value, applied
