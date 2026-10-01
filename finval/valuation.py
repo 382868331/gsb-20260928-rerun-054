@@ -11,7 +11,7 @@ from pathlib import Path
 from .contract import FixedRateContract
 from .curve import DiscountCurve
 from .floating import FloatingRateContract, MissingFixingError
-from .events import FixingCorrection, PartialTermination
+from .events import FixingCorrection, PartialTermination, RightsTransfer, TransferRevocation
 from .schedule import Cashflow, generate_floating_schedule, generate_schedule
 from .schedule import apply_schedule_events
 
@@ -303,6 +303,10 @@ def _from_primitive(value):
             return FixingCorrection(**data)
         if kind == "PartialTermination":
             return PartialTermination(**data)
+        if kind == "RightsTransfer":
+            return RightsTransfer(**data)
+        if kind == "TransferRevocation":
+            return TransferRevocation(**data)
         if kind == "Cashflow":
             return Cashflow(**data)
         if kind == "CashflowExplanation":

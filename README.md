@@ -21,6 +21,9 @@
 - **历史更正**：`FixingCorrection` 只有在到达日后才纳入估值；已支付原日程保持原实际金额，另以 `ADJUSTMENT` 调整款结算差额。
 - **部分提前终止**：`PartialTermination` 生成本金返还款和 `CANCELLED` 取消本金行；终止后的利息与期末本金按剩余名义本金重算。
 - **状态与依据**：解释字段区分 `fix_state`、`payment_state`、`schedule_state`、`cashflow_kind`，并在每笔调整款上保存 `event_id` 与 `basis`。
+- **权益转让**：`RightsTransfer` 记录转让比例、适用现金流范围（按支付日）与收到通知时刻；已支付款项仍归原支付记录，未支付的本金、利息与调整款按份额追到各持有人；交叠转让累计分出超过原权益时明确报错。
+- **转让撤销与迟到通知**：`TransferRevocation` 撤销已达成的转让；历史视角保持原结论，当前视角以 `COMPENSATION` 补偿记录说明差额。
+- **分配对账**：`allocate()` 生成 `AllocationReport`，提供原合约视角（`contract_view`）与各持有人视角（`holder_view` / `totals_by_holder`），`check_conservation()` 校验总额守恒；报告可 `save_json` / `load_json`，重开后各方已收/应收/补偿互不覆盖。
 - **存档重开**：`ValuationBatch.save_json()` / `load_json()` 保存当前日程、原始日程快照、历史结论、解释与事件依据。
 
 ## 用法
@@ -118,6 +121,36 @@ reopened = ValuationBatch.load_json("valuation-batch.json")
 ```
 
 终止生效日若落在节假日，先按合约营业日约定调整，再作为利息分段、本金返还和取消款项的共同边界；恰好在定盘日或付息日时，同日资料按“已到达/已生效”处理。
+
+### 权益转让与持有人对账
+
+```python
+from finval import RightsTransfer, TransferRevocation, allocate
+
+transfer = RightsTransfer(
+    event_id="T1",
+    to_holder="乙",
+    ratio=0.4,                            # 转让原权益的 40%
+    effective_date=date(2025, 9, 1),      # 适用现金流起点（按支付日，含）
+    end_date=None,                        # 适用现金流终点（含），None 表示至到期
+    received_date=date(2025, 10, 10),     # 收到转让通知的时刻
+    basis="转让协议",
+)
+contract = replace(contract, events=contract.events + (transfer,))
+valuation = batch.run(contract, curve)
+
+# 历史视角：通知到达前的结论不变
+hist = allocate(valuation, as_of=date(2025, 10, 5), view="HISTORICAL")
+# 当前视角：已付款项保持原支付记录，差额以 COMPENSATION 补偿记录体现
+cur = allocate(valuation, view="CURRENT")
+cur.check_conservation()                  # 总额守恒校验
+print(cur.totals_by_holder())             # 各方 已收/应收/补偿
+print(cur.contract_view())                # 原合约视角逐笔对照
+cur.save_json("allocation.json")
+```
+
+- 多次转让交叠时，任一持有人累计分出比例超过其原权益即抛出 `ValueError`。
+- `TransferRevocation` 撤销已达成的转让：撤销到达前的历史结论不变，当前视角回补差额。
 
 ## 测试
 
