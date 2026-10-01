@@ -18,6 +18,10 @@
 - **历史定盘保护**：定盘日不晚于估值日却缺少定盘值时抛出 `MissingFixingError`，预测曲线永远不会悄悄替代已发生的定盘。
 - **预测曲线**：仅定盘日晚于估值日的期间使用预测曲线推导简单复利远期利率；预测曲线可与贴现曲线不同。
 - **逐笔解释**：每条 `Valuation` 保存 `explanations`，说明该笔是 `FIXING`（含定盘日/定盘值）还是 `FORECAST`（含预测曲线与远期区间），支付日已过的期间标记为 `PAID` 且不参与 NPV。
+- **历史更正**：`FixingCorrection` 只有在到达日后才纳入估值；已支付原日程保持原实际金额，另以 `ADJUSTMENT` 调整款结算差额。
+- **部分提前终止**：`PartialTermination` 生成本金返还款和 `CANCELLED` 取消本金行；终止后的利息与期末本金按剩余名义本金重算。
+- **状态与依据**：解释字段区分 `fix_state`、`payment_state`、`schedule_state`、`cashflow_kind`，并在每笔调整款上保存 `event_id` 与 `basis`。
+- **存档重开**：`ValuationBatch.save_json()` / `load_json()` 保存当前日程、原始日程快照、历史结论、解释与事件依据。
 
 ## 用法
 
@@ -83,6 +87,37 @@ for e in v.explanations:
 
 - 修改预测曲线只影响 `rate_source == "FORECAST"` 的现金流；已定盘金额冻结在日程快照中。
 - 旧 `Valuation.cashflows` 不会随后续新曲线或新估值改变。
+
+### 历史更正与部分终止
+
+```python
+from dataclasses import replace
+
+events = (
+    FixingCorrection(
+        event_id="FIX-001",
+        fixing_date=date(2025, 5, 28),
+        old_value=0.042,
+        new_value=0.050,
+        received_date=date(2025, 10, 10),
+        settlement_date=date(2025, 10, 20),
+        basis="定盘机构更正通知",
+    ),
+    PartialTermination(
+        event_id="TERM-001",
+        effective_date=date(2025, 11, 28),
+        reduction_amount=200_000.0,
+        received_date=date(2025, 11, 20),
+        basis="双方提前终止协议",
+    ),
+)
+contract = replace(contract, events=events)
+valuation = batch.run(contract, discount, forecast)
+batch.save_json("valuation-batch.json")
+reopened = ValuationBatch.load_json("valuation-batch.json")
+```
+
+终止生效日若落在节假日，先按合约营业日约定调整，再作为利息分段、本金返还和取消款项的共同边界；恰好在定盘日或付息日时，同日资料按“已到达/已生效”处理。
 
 ## 测试
 

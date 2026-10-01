@@ -3,6 +3,7 @@
 from .calendar import Calendar, BusinessDayConvention
 from .conventions import DayCount, Frequency, UnsupportedConventionError
 from .contract import FixedRateContract, StubType
+from .events import FixingCorrection, PartialTermination
 from .floating import FloatingRateContract, MissingFixingError
 from .schedule import Cashflow, generate_floating_schedule, generate_schedule
 from .curve import DiscountCurve
@@ -18,6 +19,8 @@ __all__ = [
     "FloatingRateContract",
     "StubType",
     "MissingFixingError",
+    "FixingCorrection",
+    "PartialTermination",
     "Cashflow",
     "CashflowExplanation",
     "generate_schedule",

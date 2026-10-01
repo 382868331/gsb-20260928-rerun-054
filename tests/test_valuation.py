@@ -10,6 +10,7 @@ from finval import (
     DiscountCurve,
     FixedRateContract,
     Frequency,
+    PartialTermination,
     StubType,
     ValuationBatch,
 )
@@ -116,3 +117,46 @@ def test_notional_exchange_included_in_final_pv():
     assert final.notional_amount == 1_000_000.0
     assert final.amount == pytest.approx(1_000_000 + 1_000_000 * 0.06)
     assert v.npv == pytest.approx(final.amount * 0.97, abs=1e-3)
+
+
+def test_fixed_contract_partial_termination_splits_interest_and_redemption():
+    valuation_date = date(2025, 10, 1)
+    termination = PartialTermination(
+        event_id="TERM-FIXED",
+        effective_date=date(2025, 7, 1),
+        reduction_amount=400_000.0,
+        received_date=date(2025, 6, 1),
+        basis="固定贷款提前还本协议",
+    )
+    contract = FixedRateContract(
+        contract_id="FIXED-TERM",
+        notional=1_000_000.0,
+        fixed_rate=0.06,
+        start_date=date(2025, 1, 1),
+        end_date=date(2026, 1, 1),
+        frequency=Frequency.ANNUAL,
+        day_count=DayCount.ACT_360,
+        business_day_convention=BusinessDayConvention.UNADJUSTED,
+        stub=StubType.NONE,
+        notional_exchange=True,
+        events=(termination,),
+    )
+    curve = DiscountCurve(
+        curve_id="DISC",
+        valuation_date=valuation_date,
+        pillar_dates=(date(2026, 1, 1),),
+        discount_factors=(0.98,),
+    )
+    valuation = ValuationBatch("B").run(contract, curve)
+    principal = next(e for e in valuation.explanations if e.cashflow_kind == "TERMINATION_PRINCIPAL")
+    scheduled = valuation.explanations[-1]
+
+    assert principal.amount == 400_000.0
+    assert principal.payment_state == "PAID"
+    assert scheduled.notional_amount == 600_000.0
+    assert scheduled.event_id == "TERM-FIXED"
+    assert scheduled.interest_amount == pytest.approx(
+        1_000_000 * 0.06 * 181 / 360
+        + 600_000 * 0.06 * 184 / 360,
+        abs=1e-4,
+    )

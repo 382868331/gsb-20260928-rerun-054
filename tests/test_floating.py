@@ -10,8 +10,10 @@ from finval import (
     DayCount,
     DiscountCurve,
     FloatingRateContract,
+    FixingCorrection,
     Frequency,
     MissingFixingError,
+    PartialTermination,
     StubType,
     ValuationBatch,
     generate_floating_schedule,
@@ -195,3 +197,160 @@ def test_short_first_floating_stub_with_mid_period_valuation():
     assert second.rate_source == "FORECAST"
     assert second.forecast_start == date(2025, 9, 30)
     assert second.forecast_end == date(2026, 3, 31)
+
+
+def test_late_fixing_correction_keeps_actual_paid_amount_and_adds_adjustment():
+    valuation_date = date(2025, 10, 15)
+    correction = FixingCorrection(
+        event_id="FIX-2",
+        fixing_date=date(2025, 5, 28),
+        old_value=0.042,
+        new_value=0.050,
+        received_date=date(2025, 10, 10),
+        settlement_date=date(2025, 10, 20),
+        basis="交易所更正通知",
+    )
+    contract = make_eom_contract(KNOWN_FIXINGS)
+    object.__setattr__(contract, "events", (correction,))
+    discount = flat_curve("DISC", valuation_date, 0.03, date(2026, 3, 31))
+    forecast = flat_curve("FWD", valuation_date, 0.05, date(2026, 3, 31))
+
+    before_contract = make_eom_contract(KNOWN_FIXINGS)
+    before_curve = flat_curve("DISC", date(2025, 10, 9), 0.03, date(2026, 3, 31))
+    before_forecast = flat_curve("FWD", date(2025, 10, 9), 0.05, date(2026, 3, 31))
+    before = ValuationBatch("OLD").run(before_contract, before_curve, before_forecast)
+    after = ValuationBatch("NEW").run(contract, discount, forecast)
+
+    old_paid = after.explanations[1]
+    adjustment = next(e for e in after.explanations
+                       if e.event_id == "FIX-2" and e.cashflow_kind == "ADJUSTMENT")
+    assert old_paid.payment_state == "PAID"
+    assert old_paid.interest_amount == before.explanations[1].interest_amount
+    assert old_paid.present_value == 0.0
+    assert adjustment.cashflow_kind == "ADJUSTMENT"
+    assert adjustment.payment_state == "FUTURE"
+    assert adjustment.fixing_value == 0.050
+    assert adjustment.basis == "交易所更正通知"
+    assert adjustment.interest_amount > 0.0
+    assert len(after.original_cashflows) == 4
+
+
+def test_partial_termination_on_payment_and_fixing_boundary_reduces_later_notional():
+    valuation_date = date(2025, 11, 28)
+    termination = PartialTermination(
+        event_id="TERM-200",
+        effective_date=date(2025, 11, 28),
+        reduction_amount=200_000.0,
+        received_date=date(2025, 11, 20),
+        basis="提前终止协议",
+    )
+    fixings = {**KNOWN_FIXINGS, date(2025, 11, 26): 0.048}
+    contract = make_eom_contract(fixings)
+    object.__setattr__(contract, "events", (termination,))
+    discount = flat_curve("DISC", valuation_date, 0.03, date(2026, 3, 31))
+    forecast = flat_curve("FWD", valuation_date, 0.05, date(2026, 3, 31))
+
+    valuation = ValuationBatch("B").run(contract, discount, forecast)
+    principal = next(e for e in valuation.explanations
+                     if e.cashflow_kind == "TERMINATION_PRINCIPAL")
+    cancelled = next(e for e in valuation.explanations if e.payment_state == "CANCELLED")
+    later = valuation.explanations[-1]
+
+    assert principal.amount == 200_000.0
+    assert principal.payment_state == "PAID"
+    assert principal.basis == "提前终止协议"
+    assert cancelled.amount == -200_000.0
+    assert cancelled.status == "CANCELLED"
+    assert later.notional_amount == 0.0
+    assert later.interest_amount == pytest.approx(
+        800_000 * later.rate * valuation.cashflows[-1].accrual_factor, abs=1e-4)
+
+
+def test_holiday_termination_uses_adjusted_effective_boundary():
+    valuation_date = date(2025, 12, 2)
+    calendar = Calendar(holidays={date(2025, 5, 1), date(2025, 10, 1), date(2025, 12, 25)})
+    termination = PartialTermination(
+        event_id="TERM-HOLIDAY",
+        effective_date=date(2025, 12, 25),
+        reduction_amount=250_000.0,
+        received_date=date(2025, 12, 1),
+        basis="圣诞前终止",
+    )
+    fixings = {**KNOWN_FIXINGS, date(2025, 11, 26): 0.048}
+    contract = make_eom_contract(fixings)
+    object.__setattr__(contract, "calendar", calendar)
+    object.__setattr__(contract, "events", (termination,))
+    discount = flat_curve("DISC", valuation_date, 0.03, date(2026, 3, 31))
+    forecast = flat_curve("FWD", valuation_date, 0.05, date(2026, 3, 31))
+
+    valuation = ValuationBatch("B").run(contract, discount, forecast)
+    last = valuation.explanations[-1]
+    principal = next(e for e in valuation.explanations if e.event_id == "TERM-HOLIDAY"
+                      and e.cashflow_kind == "TERMINATION_PRINCIPAL")
+    cancelled = next(e for e in valuation.explanations if e.event_id == "TERM-HOLIDAY"
+                     and e.payment_state == "CANCELLED")
+    assert principal.payment_date == date(2025, 12, 26)
+    assert cancelled.payment_date == date(2025, 12, 26)
+    assert principal.payment_state == "FUTURE"
+    assert cancelled.payment_state == "CANCELLED"
+    assert last.cashflow_kind == "SCHEDULED"
+    scheduled = valuation.cashflows[-1]
+    assert last.interest_amount == pytest.approx(
+        1_000_000 * last.rate * (
+            date(2025, 12, 26) - scheduled.accrual_start).days / 360
+        + 750_000 * last.rate * (
+            scheduled.accrual_end - date(2025, 12, 26)).days / 360,
+        abs=1e-4)
+
+
+def test_correction_arriving_exactly_on_fixing_date_fixes_forecast_period():
+    valuation_date = date(2025, 8, 27)
+    fixings = {date(2025, 2, 26): 0.040, date(2025, 5, 28): 0.042}
+    correction = FixingCorrection(
+        event_id="FIX-INITIAL",
+        fixing_date=date(2025, 8, 27),
+        old_value=0.0,
+        new_value=0.045,
+        received_date=date(2025, 8, 27),
+        settlement_date=date(2025, 11, 28),
+        basis="定盘日发布值",
+    )
+    contract = make_eom_contract(fixings)
+    object.__setattr__(contract, "events", (correction,))
+    discount = flat_curve("DISC", valuation_date, 0.03, date(2026, 3, 31))
+    forecast = flat_curve("FWD", valuation_date, 0.05, date(2026, 3, 31))
+
+    valuation = ValuationBatch("B").run(contract, discount, forecast)
+    assert valuation.explanations[2].fix_state == "FIXED"
+    assert valuation.explanations[2].fixing_value == 0.045
+
+
+def test_batch_save_and_reload_keeps_schedule_snapshot_and_event_basis(tmp_path):
+    valuation_date = date(2025, 10, 15)
+    correction = FixingCorrection(
+        event_id="FIX-PERSIST",
+        fixing_date=date(2025, 5, 28),
+        old_value=0.042,
+        new_value=0.050,
+        received_date=date(2025, 10, 10),
+        settlement_date=date(2025, 10, 20),
+        basis="可追溯更正依据",
+    )
+    contract = make_eom_contract(KNOWN_FIXINGS)
+    object.__setattr__(contract, "events", (correction,))
+    discount = flat_curve("DISC", valuation_date, 0.03, date(2026, 3, 31))
+    forecast = flat_curve("FWD", valuation_date, 0.05, date(2026, 3, 31))
+    batch = ValuationBatch("PERSIST")
+    saved = batch.run(contract, discount, forecast)
+
+    path = tmp_path / "valuation.json"
+    batch.save_json(path)
+    reopened = ValuationBatch.load_json(path)
+    loaded = reopened.records[0]
+
+    assert reopened.batch_id == "PERSIST"
+    assert loaded.npv == saved.npv
+    assert loaded.original_cashflows == saved.original_cashflows
+    assert isinstance(loaded.events[0], FixingCorrection)
+    adjustment = next(e for e in loaded.explanations if e.cashflow_kind == "ADJUSTMENT")
+    assert adjustment.basis == "可追溯更正依据"

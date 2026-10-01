@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Mapping
+from typing import Mapping, Tuple
 
 from .calendar import BusinessDayConvention, Calendar
 from .conventions import DayCount, Frequency, UnsupportedConventionError
@@ -35,6 +35,7 @@ class FloatingRateContract:
     fixing_lag_business_days: int = 2  # 定盘日相对计息起息日的营业日滞后
     spread: float = 0.0                # 加点（年化，简单加到定盘/远期利率上）
     fixings: Mapping[date, float] = field(default_factory=dict)
+    events: Tuple[object, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.day_count, DayCount):
@@ -56,6 +57,7 @@ class FloatingRateContract:
         if self.calendar is None:
             object.__setattr__(self, "calendar", Calendar())
         object.__setattr__(self, "fixings", dict(self.fixings or {}))
+        object.__setattr__(self, "events", tuple(self.events or ()))
 
     def fixing_date(self, accrual_start: date) -> date:
         """计息期定盘日：计息起息日往前推 fixing_lag_business_days 个营业日。"""

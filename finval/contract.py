@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 from enum import Enum
+from typing import Tuple
 
 from .calendar import BusinessDayConvention, Calendar
 from .conventions import DayCount, Frequency, UnsupportedConventionError
@@ -32,6 +33,7 @@ class FixedRateContract:
     eom: bool = True                # 起息日为月末时，各周期日也落在月末
     stub: StubType = StubType.SHORT_FIRST
     notional_exchange: bool = False  # 期末是否兑付名义本金
+    events: Tuple[object, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.day_count, DayCount):
@@ -50,3 +52,4 @@ class FixedRateContract:
             raise ValueError("名义本金必须为正")
         if self.calendar is None:
             object.__setattr__(self, "calendar", Calendar())
+        object.__setattr__(self, "events", tuple(self.events or ()))
