@@ -36,6 +36,7 @@ class FloatingRateContract:
     spread: float = 0.0                # 加点（年化，简单加到定盘/远期利率上）
     fixings: Mapping[date, float] = field(default_factory=dict)
     events: Tuple[object, ...] = ()
+    holder_id: str = "ORIGINAL"
 
     def __post_init__(self) -> None:
         if not isinstance(self.day_count, DayCount):

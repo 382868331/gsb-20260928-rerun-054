@@ -12,6 +12,16 @@ from .contract import FixedRateContract
 from .curve import DiscountCurve
 from .floating import FloatingRateContract, MissingFixingError
 from .events import FixingCorrection, PartialTermination
+from .allocation import (
+    AllocationChange,
+    AllocationReport,
+    CashflowKey,
+    CompensationRecord,
+    HolderPosition,
+    HolderShare,
+    Reconciliation,
+    build_holder_allocation,
+)
 from .schedule import Cashflow, generate_floating_schedule, generate_schedule
 from .schedule import apply_schedule_events
 
@@ -56,6 +66,7 @@ class Valuation:
     forecast_curve_id: Optional[str] = None
     original_cashflows: tuple[Cashflow, ...] = ()
     events: tuple[object, ...] = ()
+    holder_allocations: Optional[AllocationReport] = None
 
     @property
     def npv(self) -> float:
@@ -176,7 +187,7 @@ def _discount_and_explain(
             fix_state=fix_state,
         ))
 
-    return Valuation(
+    valuation = Valuation(
         contract_id=contract.contract_id,
         curve_id=curve.curve_id,
         valuation_date=valuation_date,
@@ -188,6 +199,12 @@ def _discount_and_explain(
         original_cashflows=original_cashflows,
         events=events,
     )
+    object.__setattr__(
+        valuation,
+        "holder_allocations",
+        build_holder_allocation(valuation, getattr(contract, "holder_id", "ORIGINAL")),
+    )
+    return valuation
 
 
 def value_contract(
@@ -307,13 +324,26 @@ def _from_primitive(value):
             return Cashflow(**data)
         if kind == "CashflowExplanation":
             return CashflowExplanation(**data)
+        allocation_types = {
+            "CashflowKey": CashflowKey,
+            "HolderShare": HolderShare,
+            "CompensationRecord": CompensationRecord,
+            "HolderPosition": HolderPosition,
+            "AllocationReport": AllocationReport,
+            "AllocationChange": AllocationChange,
+        }
+        if kind in allocation_types:
+            return allocation_types[kind](**data)
     if isinstance(value, list):
         return tuple(_from_primitive(item) for item in value)
     return value
 
 
 def _valuation_to_dict(valuation: Valuation):
-    return {name: _to_primitive(getattr(valuation, name)) for name in valuation.__dataclass_fields__}
+    return {
+        name: _to_primitive(getattr(valuation, name))
+        for name in valuation.__dataclass_fields__
+    }
 
 
 def _valuation_from_dict(data: dict) -> Valuation:

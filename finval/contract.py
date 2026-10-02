@@ -34,6 +34,7 @@ class FixedRateContract:
     stub: StubType = StubType.SHORT_FIRST
     notional_exchange: bool = False  # 期末是否兑付名义本金
     events: Tuple[object, ...] = ()
+    holder_id: str = "ORIGINAL"
 
     def __post_init__(self) -> None:
         if not isinstance(self.day_count, DayCount):

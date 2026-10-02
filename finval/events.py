@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from typing import Tuple
 
 
 @dataclass(frozen=True)
@@ -39,3 +40,47 @@ class PartialTermination:
             object.__setattr__(self, "settlement_date", self.effective_date)
         if self.settlement_date < self.effective_date:
             raise ValueError("部分终止付款日不能早于生效日")
+
+
+@dataclass(frozen=True)
+class FutureInterestAssignment:
+    """未来权益转让。proportion 为转让方在适用范围内让出的原权益比例。"""
+
+    event_id: str
+    transferor: str
+    transferee: str
+    proportion: float
+    effective_date: date
+    received_date: date
+    basis: str
+    cashflow_scope: Tuple[str, ...] = ("INTEREST", "PRINCIPAL", "ADJUSTMENT")
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.proportion <= 1.0:
+            raise ValueError("转让比例必须位于 (0, 1] 区间")
+        if self.transferor == self.transferee:
+            raise ValueError("转让双方不能相同")
+        if not self.cashflow_scope:
+            raise ValueError("适用现金流范围不能为空")
+        allowed = {"INTEREST", "PRINCIPAL", "ADJUSTMENT", "ALL"}
+        scope = tuple(dict.fromkeys(self.cashflow_scope))
+        if any(item not in allowed for item in scope):
+            raise ValueError(f"未知现金流范围，支持: {sorted(allowed)}")
+        object.__setattr__(self, "cashflow_scope", scope)
+
+    @property
+    def normalized_scope(self) -> frozenset[str]:
+        if "ALL" in self.cashflow_scope:
+            return frozenset({"INTEREST", "PRINCIPAL", "ADJUSTMENT"})
+        return frozenset(self.cashflow_scope)
+
+
+@dataclass(frozen=True)
+class AssignmentRevocation:
+    """转让通知撤销；已发生的收款记录不回写，只形成对账补偿。"""
+
+    event_id: str
+    assignment_id: str
+    received_date: date
+    basis: str
+    effective_date: date | None = None

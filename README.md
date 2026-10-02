@@ -20,8 +20,11 @@
 - **逐笔解释**：每条 `Valuation` 保存 `explanations`，说明该笔是 `FIXING`（含定盘日/定盘值）还是 `FORECAST`（含预测曲线与远期区间），支付日已过的期间标记为 `PAID` 且不参与 NPV。
 - **历史更正**：`FixingCorrection` 只有在到达日后才纳入估值；已支付原日程保持原实际金额，另以 `ADJUSTMENT` 调整款结算差额。
 - **部分提前终止**：`PartialTermination` 生成本金返还款和 `CANCELLED` 取消本金行；终止后的利息与期末本金按剩余名义本金重算。
+- **未来权益转让**：`FutureInterestAssignment` 分别保存转让比例、`cashflow_scope` 与 `received_date`；已支付款项保留在原收款记录，未来本金、利息和调整款按各持有人份额拆分。多次转让按原权益余额校验，任何交叠都不能分出超过 100% 的金额。
+- **双视角对账**：`Valuation.holder_allocations` 提供原合约及各持有人的应收、已收、现值和补偿；迟到通知不重写历史收款，而在当前视角生成 `LATE_ASSIGNMENT_NOTICE`。`AssignmentRevocation` 撤销后，未来款项回归原权益，已付款生成 `ASSIGNMENT_REVOKED_AFTER_PAYMENT` 补偿。
+- **转让对账**：`build_holder_allocation()` 可单独重算估值份额；`reconcile_allocations()` 对比历史估值与当前估值，列示转让、终止或定盘更正引起的各方分配变化。
 - **状态与依据**：解释字段区分 `fix_state`、`payment_state`、`schedule_state`、`cashflow_kind`，并在每笔调整款上保存 `event_id` 与 `basis`。
-- **存档重开**：`ValuationBatch.save_json()` / `load_json()` 保存当前日程、原始日程快照、历史结论、解释与事件依据。
+- **存档重开**：`ValuationBatch.save_json()` / `load_json()` 保存当前日程、原始日程快照、历史结论、解释、事件依据与持有人份额；重开后各方应收、已收和补偿为独立字段，不会相互覆盖。
 
 ## 用法
 
