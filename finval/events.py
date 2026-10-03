@@ -1,4 +1,4 @@
-"""历史事件：定盘更正、部分提前终止、未来权益转让与撤销。"""
+"""历史事件：定盘更正、部分提前终止、权益转让/撤销与单位拆并。"""
 
 from __future__ import annotations
 
@@ -53,20 +53,29 @@ class RightsTransfer:
 
     event_id: str
     to_holder: str
-    ratio: float
     effective_date: date
     received_date: date
     basis: str
+    ratio: Optional[float] = None
+    units: Optional[float] = None
     from_holder: str = "ORIGINAL"
     end_date: Optional[date] = None   # 适用现金流终点（含），None 表示至到期
 
     def __post_init__(self) -> None:
-        if not 0 < self.ratio <= 1:
+        if (self.ratio is None) == (self.units is None):
+            raise ValueError("ratio 与 units 必须且只能给出一个")
+        if self.ratio is not None and not 0 < self.ratio <= 1:
             raise ValueError("转让比例必须在 (0, 1] 区间")
+        if self.units is not None and self.units <= 0:
+            raise ValueError("转让单位数量必须为正")
         if self.end_date is not None and self.end_date < self.effective_date:
             raise ValueError("转让适用终点不能早于起点")
         if self.to_holder == self.from_holder:
             raise ValueError("转让双方不能是同一持有人")
+
+    @property
+    def kind(self) -> str:
+        return "RATIO" if self.ratio is not None else "UNITS"
 
 
 @dataclass(frozen=True)
@@ -77,3 +86,29 @@ class TransferRevocation:
     transfer_event_id: str
     received_date: date
     basis: str
+
+
+@dataclass(frozen=True)
+class UnitChange:
+    """单位拆分或合并：每 1 单位变为 factor 单位，经济权益总量不变。
+
+    factor > 1 为拆分（如 1 拆 10），0 < factor < 1 为合并（如 5 并 1
+    即 factor=0.2）。effective_date 为单位口径切换日；received_date 为
+    收到通知的时刻，迟到通知只改变当前解释，历史视角保持当时结论。
+    """
+
+    event_id: str
+    effective_date: date
+    factor: float
+    received_date: date
+    basis: str
+
+    def __post_init__(self) -> None:
+        if self.factor <= 0:
+            raise ValueError("单位变化系数必须为正")
+        if self.factor == 1:
+            raise ValueError("单位变化系数不能为 1（无实际变化）")
+
+    @property
+    def kind(self) -> str:
+        return "SPLIT" if self.factor > 1 else "MERGE"

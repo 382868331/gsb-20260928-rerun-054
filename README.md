@@ -23,6 +23,9 @@
 - **状态与依据**：解释字段区分 `fix_state`、`payment_state`、`schedule_state`、`cashflow_kind`，并在每笔调整款上保存 `event_id` 与 `basis`。
 - **权益转让**：`RightsTransfer` 记录转让比例、适用现金流范围（按支付日）与收到通知时刻；已支付款项仍归原支付记录，未支付的本金、利息与调整款按份额追到各持有人；交叠转让累计分出超过原权益时明确报错。
 - **转让撤销与迟到通知**：`TransferRevocation` 撤销已达成的转让；历史视角保持原结论，当前视角以 `COMPENSATION` 补偿记录说明差额。
+- **单位拆分/合并**：`UnitChange` 记录单位口径变化（`factor>1` 拆分、`0<factor<1` 合并），与经济权益比例分别记录；`holder_positions()` 给出某知识时点下各持有人的单位数与原合约权益比例，单位变多不会凭空增加应收金额。
+- **固定单位 vs 固定比例转让**：`RightsTransfer` 的 `units` 与 `ratio` 二选一；固定单位按转让生效日的单位口径折算为权益比例，之后的拆分/合并不改变其对应权益，两种约定始终可分别追查。
+- **舍入归属**：每个持有人份额独立舍入到最小可分单位（6 位小数），未分配余量在 `contract_view()` 的 `unallocated_residual` 单列，不与任何持有人份额混同。
 - **分配对账**：`allocate()` 生成 `AllocationReport`，提供原合约视角（`contract_view`）与各持有人视角（`holder_view` / `totals_by_holder`），`check_conservation()` 校验总额守恒；报告可 `save_json` / `load_json`，重开后各方已收/应收/补偿互不覆盖。
 - **存档重开**：`ValuationBatch.save_json()` / `load_json()` 保存当前日程、原始日程快照、历史结论、解释与事件依据。
 
@@ -151,6 +154,36 @@ cur.save_json("allocation.json")
 
 - 多次转让交叠时，任一持有人累计分出比例超过其原权益即抛出 `ValueError`。
 - `TransferRevocation` 撤销已达成的转让：撤销到达前的历史结论不变，当前视角回补差额。
+
+### 单位拆分/合并与持仓查询
+
+```python
+from finval import UnitChange, holder_positions
+
+split = UnitChange(
+    event_id="U1",
+    effective_date=date(2025, 10, 15),   # 单位口径切换日
+    factor=10.0,                         # 1 拆 10；合并用 0 < factor < 1
+    received_date=date(2025, 10, 20),    # 通知可晚于生效日
+    basis="拆分公告",
+)
+contract = replace(contract, total_units=100.0,
+                   events=contract.events + (split,))
+valuation = batch.run(contract, curve)
+
+# 某知识时点下各持有人的单位数与原合约权益比例
+for p in holder_positions(valuation, as_of=date(2025, 12, 1)):
+    print(p.holder, p.units, p.equity_ratio)
+
+# 固定单位转让：按生效日单位口径折算，之后拆并不改变其权益
+t_units = RightsTransfer(event_id="T2", to_holder="丙", units=30.0,
+                         effective_date=date(2025, 11, 1),
+                         received_date=date(2025, 11, 1), basis="固定单位转让")
+```
+
+- 拆分/合并只改变单位数，不改变权益比例；迟到的拆分通知不改动已付款项的金钱归属，若改变未付款项解释则以 `COMPENSATION` 记录差额。
+- 每笔 `HolderShare.unit_factor` 标明该笔现金流采用的单位口径（变化前/后）。
+- `contract_view()` 逐笔列示总额、已分配合计与 `unallocated_residual` 舍入余量；`check_conservation()` 校验 份额 + 余量 = 原金额。
 
 ## 测试
 

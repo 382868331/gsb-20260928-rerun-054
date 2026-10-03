@@ -33,6 +33,7 @@ class FixedRateContract:
     eom: bool = True                # 起息日为月末时，各周期日也落在月末
     stub: StubType = StubType.SHORT_FIRST
     notional_exchange: bool = False  # 期末是否兑付名义本金
+    total_units: float = 1.0         # 合约总单位数（拆分/合并前的初始口径）
     events: Tuple[object, ...] = ()
 
     def __post_init__(self) -> None:
@@ -50,6 +51,8 @@ class FixedRateContract:
             raise ValueError("到期日必须晚于起息日")
         if self.notional <= 0:
             raise ValueError("名义本金必须为正")
+        if self.total_units <= 0:
+            raise ValueError("合约总单位数必须为正")
         if self.calendar is None:
             object.__setattr__(self, "calendar", Calendar())
         object.__setattr__(self, "events", tuple(self.events or ()))

@@ -35,6 +35,7 @@ class FloatingRateContract:
     fixing_lag_business_days: int = 2  # 定盘日相对计息起息日的营业日滞后
     spread: float = 0.0                # 加点（年化，简单加到定盘/远期利率上）
     fixings: Mapping[date, float] = field(default_factory=dict)
+    total_units: float = 1.0         # 合约总单位数（拆分/合并前的初始口径）
     events: Tuple[object, ...] = ()
 
     def __post_init__(self) -> None:
@@ -52,6 +53,8 @@ class FloatingRateContract:
             raise ValueError("到期日必须晚于起息日")
         if self.notional <= 0:
             raise ValueError("名义本金必须为正")
+        if self.total_units <= 0:
+            raise ValueError("合约总单位数必须为正")
         if self.fixing_lag_business_days < 0:
             raise ValueError("定盘滞后营业日数不能为负")
         if self.calendar is None:

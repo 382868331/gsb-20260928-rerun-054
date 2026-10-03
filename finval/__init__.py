@@ -3,7 +3,13 @@
 from .calendar import Calendar, BusinessDayConvention
 from .conventions import DayCount, Frequency, UnsupportedConventionError
 from .contract import FixedRateContract, StubType
-from .events import FixingCorrection, PartialTermination, RightsTransfer, TransferRevocation
+from .events import (
+    FixingCorrection,
+    PartialTermination,
+    RightsTransfer,
+    TransferRevocation,
+    UnitChange,
+)
 from .floating import FloatingRateContract, MissingFixingError
 from .schedule import Cashflow, generate_floating_schedule, generate_schedule
 from .curve import DiscountCurve
@@ -12,8 +18,11 @@ from .allocation import (
     ORIGINAL_HOLDER,
     AllocationReport,
     CashflowTotal,
+    HolderPosition,
     HolderShare,
     allocate,
+    holder_positions,
+    unit_factor_at,
 )
 
 __all__ = [
@@ -30,6 +39,7 @@ __all__ = [
     "PartialTermination",
     "RightsTransfer",
     "TransferRevocation",
+    "UnitChange",
     "Cashflow",
     "CashflowExplanation",
     "generate_schedule",
@@ -41,6 +51,9 @@ __all__ = [
     "ORIGINAL_HOLDER",
     "AllocationReport",
     "CashflowTotal",
+    "HolderPosition",
     "HolderShare",
     "allocate",
+    "holder_positions",
+    "unit_factor_at",
 ]

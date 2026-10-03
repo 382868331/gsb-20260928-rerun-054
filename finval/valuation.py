@@ -11,7 +11,13 @@ from pathlib import Path
 from .contract import FixedRateContract
 from .curve import DiscountCurve
 from .floating import FloatingRateContract, MissingFixingError
-from .events import FixingCorrection, PartialTermination, RightsTransfer, TransferRevocation
+from .events import (
+    FixingCorrection,
+    PartialTermination,
+    RightsTransfer,
+    TransferRevocation,
+    UnitChange,
+)
 from .schedule import Cashflow, generate_floating_schedule, generate_schedule
 from .schedule import apply_schedule_events
 
@@ -56,6 +62,7 @@ class Valuation:
     forecast_curve_id: Optional[str] = None
     original_cashflows: tuple[Cashflow, ...] = ()
     events: tuple[object, ...] = ()
+    total_units: float = 1.0
 
     @property
     def npv(self) -> float:
@@ -187,6 +194,7 @@ def _discount_and_explain(
         forecast_curve_id=forecast_curve.curve_id if forecast_curve else None,
         original_cashflows=original_cashflows,
         events=events,
+        total_units=getattr(contract, "total_units", 1.0),
     )
 
 
@@ -307,6 +315,8 @@ def _from_primitive(value):
             return RightsTransfer(**data)
         if kind == "TransferRevocation":
             return TransferRevocation(**data)
+        if kind == "UnitChange":
+            return UnitChange(**data)
         if kind == "Cashflow":
             return Cashflow(**data)
         if kind == "CashflowExplanation":
