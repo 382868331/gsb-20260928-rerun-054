@@ -23,7 +23,10 @@
 - **状态与依据**：解释字段区分 `fix_state`、`payment_state`、`schedule_state`、`cashflow_kind`，并在每笔调整款上保存 `event_id` 与 `basis`。
 - **权益转让**：`RightsTransfer` 记录转让比例、适用现金流范围（按支付日）与收到通知时刻；已支付款项仍归原支付记录，未支付的本金、利息与调整款按份额追到各持有人；交叠转让累计分出超过原权益时明确报错。
 - **转让撤销与迟到通知**：`TransferRevocation` 撤销已达成的转让；历史视角保持原结论，当前视角以 `COMPENSATION` 补偿记录说明差额。
-- **分配对账**：`allocate()` 生成 `AllocationReport`，提供原合约视角（`contract_view`）与各持有人视角（`holder_view` / `totals_by_holder`），`check_conservation()` 校验总额守恒；报告可 `save_json` / `load_json`，重开后各方已收/应收/补偿互不覆盖。
+- **单位拆分与合并**：`UnitSplit` / `UnitMerge` 只改变计量单位口径，经济权益比例与应收金额不变；每笔现金流按支付日分别采用变化前/后的单位解释（`CashflowTotal.total_units`、`HolderShare.units`），`positions` 给出各持有人在某一时点的单位数量与占原合约权益比例。
+- **固定单位与固定比例转让**：`RightsTransfer` 可指定 `ratio`（固定比例）或 `units`（固定单位数量，按生效时点单位口径折算为权益比例），`spec_kind` 分别记录、可追查；后续合并按各自口径折算，不会把两种约定混为一谈。
+- **舍入与余量对账**：`allocate(..., rounding_unit=...)` 指定金额最小可分单位，每份独立舍入，未分配余量逐笔显式记录为 `CashflowResidual`，`contract_view` 对照总额/已分配/余量，不把误差藏进任何一位持有人。
+- **分配对账**：`allocate()` 生成 `AllocationReport`，提供原合约视角（`contract_view`）与各持有人视角（`holder_view` / `totals_by_holder`），`check_conservation()` 校验总额守恒（份额+补偿+余量=总额）；报告可 `save_json` / `load_json`，重开后各方已收/应收/补偿互不覆盖；事件按确定性顺序处理，同一知识时点下不同接收顺序得到一致结论。
 - **存档重开**：`ValuationBatch.save_json()` / `load_json()` 保存当前日程、原始日程快照、历史结论、解释与事件依据。
 
 ## 用法
@@ -151,6 +154,37 @@ cur.save_json("allocation.json")
 
 - 多次转让交叠时，任一持有人累计分出比例超过其原权益即抛出 `ValueError`。
 - `TransferRevocation` 撤销已达成的转让：撤销到达前的历史结论不变，当前视角回补差额。
+
+### 单位拆分/合并与持仓解释
+
+```python
+from finval import UnitSplit, UnitMerge
+
+split = UnitSplit(
+    event_id="S1",
+    effective_date=date(2025, 10, 1),   # 该日（按支付日）起采用新单位口径
+    factor=2.0,                         # 每 1 单位变为 2 单位
+    received_date=date(2025, 9, 15),    # 通知到达时刻（可晚于生效日）
+    basis="拆分公告",
+)
+contract = replace(contract, events=contract.events + (split,))
+valuation = batch.run(contract, curve)
+
+report = allocate(valuation, initial_units=1000, rounding_unit=0.01)
+for pos in report.positions:            # 各持有人：单位数量 + 占原合约权益比例
+    print(pos.holder, pos.units, pos.equity_ratio)
+for row in report.contract_view():      # 逐笔：总额 / 已分配 / 未分配余量 / 单位口径
+    print(row["cashflow_index"], row["amount"], row["allocated"],
+          row["residual"], row["total_units"])
+```
+
+- 拆分/合并不改变任何持有人的经济权益比例，单位变多不会凭空增加应收金额。
+- 拆分通知迟到时，历史视角保持当时已知材料下的结论；当前视角下若固定单位
+  转让的折算比例因此改变，差额以 `COMPENSATION` 记录并注明迟到事件依据。
+- `RightsTransfer(units=N, ratio=None)` 表示转让固定单位数量（按生效时点
+  单位口径折算）；与 `ratio=` 固定比例转让分别记录（`spec_kind`），
+  后续合并按各自口径折算，不会混为一谈。
+- 撤销尚未生效的转让只影响未来决定，不产生补偿记录。
 
 ## 测试
 
