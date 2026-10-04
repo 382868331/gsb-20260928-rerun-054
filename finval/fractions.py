@@ -20,9 +20,11 @@
 
 from __future__ import annotations
 
+import json
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date
+from pathlib import Path
 from typing import Optional
 
 from .allocation import (
@@ -88,19 +90,36 @@ class FractionReport:
         return tuple(r for r in self.records if r.holder == holder)
 
     def cash_summary(self) -> dict:
-        """各持有人现金视图：待定单位、可用现金、调整三类分列。"""
+        """各持有人现金视图：待定单位、净可用现金、调整三类分列。
+
+        可用现金是已确认现金分配与全部已确认价格/撤回调整后的净额；
+        adjustments 仍单独列示调整发生额，便于审计轨迹核对。
+        """
         out: dict = {}
         for r in self.records:
             bucket = out.setdefault(r.holder, {
                 "pending_units": 0.0, "available_cash": 0.0, "adjustments": 0.0})
             if r.kind == "PENDING_CASH":
                 bucket["pending_units"] += r.units
-            elif r.kind == "CASH_IN_LIEU":
-                bucket["available_cash"] += r.cash_amount
-            elif r.kind in ("PRICE_ADJUSTMENT", "REVOCATION_ADJUSTMENT"):
-                bucket["adjustments"] += r.cash_amount
+            elif r.kind in ("CASH_IN_LIEU", "PRICE_ADJUSTMENT",
+                            "REVOCATION_ADJUSTMENT"):
+                if r.cash_amount is not None:
+                    bucket["available_cash"] += r.cash_amount
+                    if r.kind != "CASH_IN_LIEU":
+                        bucket["adjustments"] += r.cash_amount
+        pending_keys = {
+            (r.holder, r.unit_change_event_id)
+            for r in self.records if r.kind == "PENDING_CASH"
+        }
+        for holder, bucket in out.items():
+            for r in self.records:
+                if (r.holder == holder
+                        and r.kind == "REVOCATION_ADJUSTMENT"
+                        and r.price is None
+                        and (r.holder, r.unit_change_event_id) in pending_keys):
+                    bucket["pending_units"] -= r.units
         return {h: {k: round(v, ROUND_DECIMALS) for k, v in bucket.items()}
-                for h, bucket in out.items()}
+                for h, bucket in sorted(out.items())}
 
     def retained_units(self) -> dict:
         """各持有人保留累积的零碎单位（含转入、含被撤回恢复部分）。"""
@@ -125,6 +144,9 @@ class FractionReport:
                           "TRANSFER_OUT"):
                 key = (r.unit_change_event_id, r.holder)
                 disposed[key] = disposed.get(key, 0.0) + r.units
+            if r.kind == "REVOCATION_ADJUSTMENT":
+                key = (r.unit_change_event_id, r.holder)
+                disposed[key] = disposed.get(key, 0.0) - r.units
             if r.kind == "TRANSFER_OUT":
                 transferred_out += r.units
             elif r.kind == "TRANSFER_IN":
@@ -145,6 +167,44 @@ class FractionReport:
             raise AssertionError(
                 f"资金不守恒: 落账 {booked} + 余量 {sum(self.residuals)} != 精确 {exact}")
         return True
+
+    def save_json(self, path: str | Path) -> None:
+        Path(path).write_text(
+            json.dumps(_fraction_report_to_dict(self), ensure_ascii=False, indent=2),
+            encoding="utf-8")
+
+    @classmethod
+    def load_json(cls, path: str | Path) -> "FractionReport":
+        return _fraction_report_from_dict(
+            json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+def _record_to_dict(record: FractionRecord) -> dict:
+    return asdict(record)
+
+
+def _record_from_dict(data: dict) -> FractionRecord:
+    return FractionRecord(**data)
+
+
+def _fraction_report_to_dict(report: FractionReport) -> dict:
+    return {
+        "contract_id": report.contract_id,
+        "as_of": report.as_of.isoformat(),
+        "generated": [asdict(item) for item in report.generated],
+        "records": [_record_to_dict(item) for item in report.records],
+        "residuals": list(report.residuals),
+    }
+
+
+def _fraction_report_from_dict(data: dict) -> FractionReport:
+    return FractionReport(
+        contract_id=data["contract_id"],
+        as_of=date.fromisoformat(data["as_of"]),
+        generated=tuple(GeneratedFraction(**item) for item in data["generated"]),
+        records=tuple(_record_from_dict(item) for item in data["records"]),
+        residuals=tuple(data["residuals"]),
+    )
 
 
 def _price_chain(events, uc_event_id: str, as_of: date) -> tuple[CashPriceFixing, ...]:
@@ -233,23 +293,23 @@ def fraction_settlement(valuation: Valuation, as_of: Optional[date] = None) -> F
             if election is not None and election.effective_date < uc.effective_date:
                 election = None   # 选择截止日早于变化生效日，不适用
             method = election.method if election is not None else "RETAIN"
-            portion = revoked.get(election.event_id, 0.0) if election else 0.0
-            elected_frac = frac * (1 - portion)
-            revoked_frac = frac * portion
             ratio_denom = total_units * factor_after
 
-            if revoked_frac > _EPS:
-                rev_id, rev_basis = revocation_basis[election.event_id]
-                add(holder, uc.event_id, "RETAINED", revoked_frac,
-                    None, None, rev_id, rev_basis)
-            if elected_frac <= _EPS:
-                continue
             if method == "RETAIN":
-                add(holder, uc.event_id, "RETAINED", elected_frac,
+                add(holder, uc.event_id, "RETAINED", frac,
                     None, None,
                     election.event_id if election else None,
                     election.basis if election else "默认保留累积")
             elif method == "TRANSFER":
+                portion = revoked.get(election.event_id, 0.0) if election else 0.0
+                elected_frac = frac * (1.0 - portion)
+                revoked_frac = frac * portion
+                if revoked_frac > _EPS:
+                    rev_id, rev_basis = revocation_basis[election.event_id]
+                    add(holder, uc.event_id, "RETAINED", revoked_frac,
+                        None, None, rev_id, rev_basis)
+                if elected_frac <= _EPS:
+                    continue
                 removed[holder] = removed.get(holder, 0.0) + elected_frac / ratio_denom
                 removed[election.to_holder] = (
                     removed.get(election.to_holder, 0.0) - elected_frac / ratio_denom)
@@ -258,31 +318,86 @@ def fraction_settlement(valuation: Valuation, as_of: Optional[date] = None) -> F
                 add(election.to_holder, uc.event_id, "TRANSFER_IN", elected_frac,
                     None, None, election.event_id, election.basis)
             else:  # CASH
-                removed[holder] = removed.get(holder, 0.0) + elected_frac / ratio_denom
-                if not price_chain:
-                    add(holder, uc.event_id, "PENDING_CASH", elected_frac,
-                        None, None, election.event_id, election.basis)
-                    continue
-                base = price_chain[0]
-                add(holder, uc.event_id, "CASH_IN_LIEU", elected_frac,
-                    base.price_per_unit, elected_frac * base.price_per_unit,
-                    base.event_id, base.basis)
-                for prev, nxt in zip(price_chain, price_chain[1:]):
-                    add(holder, uc.event_id, "PRICE_ADJUSTMENT", elected_frac,
-                        nxt.price_per_unit,
-                        elected_frac * (nxt.price_per_unit - prev.price_per_unit),
-                        nxt.event_id, nxt.basis)
-                if revoked_frac > _EPS:
-                    final_price = price_chain[-1].price_per_unit
-                    rev_id, rev_basis = revocation_basis[election.event_id]
-                    add(holder, uc.event_id, "REVOCATION_ADJUSTMENT", revoked_frac,
-                        final_price, -(revoked_frac * final_price),
-                        rev_id, rev_basis)
+                pending_units = frac
+                cash_units = 0.0
+                latest_price = None
+                timeline = []
+                if election is not None:
+                    timeline.append((election.received_date, 0, election.event_id, election))
+                for price in price_chain:
+                    timeline.append((price.received_date, 1, price.event_id, price))
+                for event in events:
+                    if (isinstance(event, ElectionRevocation)
+                            and election is not None
+                            and event.election_event_id == election.event_id
+                            and event.received_date <= as_of):
+                        timeline.append((event.received_date, 2, event.event_id, event))
+                timeline.sort(key=lambda item: (item[0], item[1], item[2]))
+
+                already_revoked = 0.0
+                for _, _, _, event in timeline:
+                    if isinstance(event, FractionElection):
+                        if pending_units > _EPS and latest_price is None:
+                            add(holder, uc.event_id, "PENDING_CASH", pending_units,
+                                None, None, event.event_id, event.basis)
+                    elif isinstance(event, CashPriceFixing):
+                        if latest_price is None:
+                            if pending_units > _EPS:
+                                cash_units = pending_units
+                                pending_units = 0.0
+                                for index in range(len(records) - 1, -1, -1):
+                                    prior = records[index]
+                                    if (prior.holder == holder
+                                            and prior.unit_change_event_id == uc.event_id
+                                            and prior.kind in (
+                                                "PENDING_CASH",
+                                                "REVOCATION_ADJUSTMENT")
+                                            and (prior.kind == "PENDING_CASH"
+                                                 or prior.price is None)):
+                                        del records[index]
+                                        seq -= 1
+                                add(holder, uc.event_id, "CASH_IN_LIEU", cash_units,
+                                    event.price_per_unit,
+                                    cash_units * event.price_per_unit,
+                                    event.event_id, event.basis)
+                        elif cash_units > _EPS:
+                            add(holder, uc.event_id, "PRICE_ADJUSTMENT", cash_units,
+                                event.price_per_unit,
+                                cash_units * (event.price_per_unit - latest_price),
+                                event.event_id, event.basis)
+                        latest_price = event.price_per_unit
+                    else:
+                        revocation_portion = min(
+                            max(event.portion - already_revoked, 0.0),
+                            1.0 - already_revoked)
+                        newly_revoked = frac * revocation_portion
+                        already_revoked += revocation_portion
+                        if newly_revoked <= _EPS:
+                            continue
+                        add(holder, uc.event_id, "RETAINED", newly_revoked,
+                            None, None, event.event_id, event.basis)
+                        if pending_units > _EPS:
+                            revoked_now = min(newly_revoked, pending_units)
+                            pending_units -= revoked_now
+                            add(holder, uc.event_id, "REVOCATION_ADJUSTMENT", revoked_now,
+                                None, None, event.event_id, event.basis)
+                            newly_revoked -= revoked_now
+                        if newly_revoked > _EPS and cash_units > _EPS:
+                            revoked_now = min(newly_revoked, cash_units)
+                            cash_units -= revoked_now
+                            add(holder, uc.event_id, "REVOCATION_ADJUSTMENT", revoked_now,
+                                latest_price, -(revoked_now * latest_price),
+                                event.event_id, event.basis)
+
+                if cash_units > _EPS:
+                    removed[holder] = (
+                        removed.get(holder, 0.0) + cash_units / ratio_denom)
 
     return FractionReport(
         contract_id=valuation.contract_id,
         as_of=as_of,
         generated=tuple(generated),
-        records=tuple(records),
+        records=tuple(replace(record, seq=index)
+                      for index, record in enumerate(records)),
         residuals=tuple(residuals),
     )

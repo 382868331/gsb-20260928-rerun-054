@@ -13,6 +13,7 @@ from finval import (
     DiscountCurve,
     ElectionRevocation,
     FixedRateContract,
+    FractionReport,
     FractionElection,
     Frequency,
     RightsTransfer,
@@ -63,6 +64,11 @@ AS_OF = date(2025, 12, 1)
 
 def run(events):
     contract = make_contract(events=events)
+    return ValuationBatch("B").run(contract, make_curve(AS_OF))
+
+
+def run_units(events, total_units):
+    contract = make_contract(events=events, total_units=total_units)
     return ValuationBatch("B").run(contract, make_curve(AS_OF))
 
 
@@ -187,17 +193,200 @@ def test_partial_election_revocation_tracked_adjustment():
     after.check_conservation()
     yi = after.holder_records("乙")
     kinds = [r.kind for r in yi]
-    assert kinds == ["RETAINED", "CASH_IN_LIEU", "REVOCATION_ADJUSTMENT"]
-    retained, cash, clawback = yi
+    assert kinds == ["CASH_IN_LIEU", "RETAINED", "REVOCATION_ADJUSTMENT"]
+    cash, retained, clawback = yi
     assert retained.units == pytest.approx(1 / 18)
     assert retained.event_id == "R1"
-    assert cash.units == pytest.approx(1 / 18)
-    assert cash.cash_amount == pytest.approx(0.55)
+    assert cash.units == pytest.approx(1 / 9)
+    assert cash.cash_amount == pytest.approx(1.1)
     assert clawback.exact_cash == pytest.approx(-0.55)
     assert clawback.event_id == "R1"
     summary = after.cash_summary()
     assert summary["乙"]["available_cash"] == pytest.approx(0.55)
     assert summary["乙"]["adjustments"] == pytest.approx(-0.55)
+
+
+def test_correction_then_partial_revocation_keeps_original_entry():
+    split = UnitChange(
+        event_id="U-FRACTION", effective_date=date(2025, 10, 1),
+        factor=1.25, received_date=date(2025, 10, 1), basis="1拆1.25")
+    election = FractionElection(
+        event_id="E1", holder="ORIGINAL",
+        unit_change_event_id="U-FRACTION", method="CASH",
+        effective_date=date(2025, 10, 1), received_date=date(2025, 10, 1),
+        basis="现金替代选择")
+    first_price = CashPriceFixing(
+        event_id="P1", unit_change_event_id="U-FRACTION",
+        price_per_unit=7.2, received_date=date(2025, 10, 2),
+        basis="首次定价")
+    corrected_price = CashPriceFixing(
+        event_id="P2", unit_change_event_id="U-FRACTION",
+        price_per_unit=8.4, received_date=date(2025, 10, 3),
+        corrects_event_id="P1", basis="价格更正")
+    revocation = ElectionRevocation(
+        event_id="R1", election_event_id="E1", portion=0.25,
+        received_date=date(2025, 10, 4), basis="撤回四分之一")
+    valuation = run_units(
+        (split, election, first_price, corrected_price, revocation),
+        total_units=1.0)
+    report = fraction_settlement(valuation, as_of=date(2025, 10, 5))
+    report.check_conservation()
+
+    records = report.holder_records("ORIGINAL")
+    assert [r.kind for r in records] == [
+        "CASH_IN_LIEU", "PRICE_ADJUSTMENT",
+        "RETAINED", "REVOCATION_ADJUSTMENT",
+    ]
+    cash, price_adjustment, retained, clawback = records
+    assert cash.units == pytest.approx(0.25)
+    assert cash.cash_amount == pytest.approx(1.8)
+    assert cash.event_id == "P1"
+    assert price_adjustment.units == pytest.approx(0.25)
+    assert price_adjustment.cash_amount == pytest.approx(0.3)
+    assert retained.units == pytest.approx(0.0625)
+    assert clawback.units == pytest.approx(0.0625)
+    assert clawback.price == pytest.approx(8.4)
+    assert clawback.cash_amount == pytest.approx(-0.525)
+    summary = report.cash_summary()["ORIGINAL"]
+    assert summary["available_cash"] == pytest.approx(1.575)
+    assert summary["adjustments"] == pytest.approx(-0.225)
+    assert summary["pending_units"] == 0.0
+
+
+def test_consecutive_corrections_each_apply_once():
+    split = UnitChange(
+        event_id="U-FRACTION", effective_date=date(2025, 10, 1),
+        factor=1.25, received_date=date(2025, 10, 1), basis="1拆1.25")
+    election = FractionElection(
+        event_id="E1", holder="ORIGINAL",
+        unit_change_event_id="U-FRACTION", method="CASH",
+        effective_date=date(2025, 10, 1), received_date=date(2025, 10, 1),
+        basis="现金替代选择")
+    prices = (
+        CashPriceFixing(
+            event_id="P1", unit_change_event_id="U-FRACTION",
+            price_per_unit=7.2, received_date=date(2025, 10, 2),
+            basis="首次定价"),
+        CashPriceFixing(
+            event_id="P2", unit_change_event_id="U-FRACTION",
+            price_per_unit=8.4, received_date=date(2025, 10, 3),
+            corrects_event_id="P1", basis="第一次更正"),
+        CashPriceFixing(
+            event_id="P3", unit_change_event_id="U-FRACTION",
+            price_per_unit=9.0, received_date=date(2025, 10, 4),
+            corrects_event_id="P2", basis="第二次更正"),
+    )
+    revocation = ElectionRevocation(
+        event_id="R1", election_event_id="E1", portion=0.25,
+        received_date=date(2025, 10, 5), basis="撤回四分之一")
+    report = fraction_settlement(
+        run_units((split, election) + prices + (revocation,), 1.0),
+        as_of=date(2025, 10, 6))
+    adjustments = [r for r in report.records if r.kind == "PRICE_ADJUSTMENT"]
+    assert [r.event_id for r in adjustments] == ["P2", "P3"]
+    assert [r.units for r in adjustments] == pytest.approx([0.25, 0.25])
+    assert [r.cash_amount for r in adjustments] == pytest.approx([0.3, 0.15])
+    clawback = next(r for r in report.records if r.kind == "REVOCATION_ADJUSTMENT")
+    assert clawback.cash_amount == pytest.approx(-0.5625)
+    assert report.cash_summary()["ORIGINAL"]["available_cash"] == pytest.approx(
+        1.8 + 0.3 + 0.15 - 0.5625)
+
+
+def test_revocation_before_pricing_restores_units_without_cash_clawback():
+    split = UnitChange(
+        event_id="U-FRACTION", effective_date=date(2025, 10, 1),
+        factor=1.25, received_date=date(2025, 10, 1), basis="1拆1.25")
+    election = FractionElection(
+        event_id="E1", holder="ORIGINAL",
+        unit_change_event_id="U-FRACTION", method="CASH",
+        effective_date=date(2025, 10, 1), received_date=date(2025, 10, 1),
+        basis="现金替代选择")
+    revocation = ElectionRevocation(
+        event_id="R1", election_event_id="E1", portion=0.25,
+        received_date=date(2025, 10, 2), basis="撤回四分之一")
+    price = CashPriceFixing(
+        event_id="P1", unit_change_event_id="U-FRACTION",
+        price_per_unit=8.4, received_date=date(2025, 10, 3), basis="定价")
+    before_pricing = fraction_settlement(
+        run_units((split, election, revocation, price), 1.0),
+        as_of=date(2025, 10, 2))
+    before_pricing.check_conservation()
+    assert [r.kind for r in before_pricing.holder_records("ORIGINAL")] == [
+        "PENDING_CASH", "RETAINED", "REVOCATION_ADJUSTMENT"]
+    before_summary = before_pricing.cash_summary()["ORIGINAL"]
+    assert before_summary["pending_units"] == pytest.approx(0.1875)
+    assert before_summary["available_cash"] == 0.0
+    report = fraction_settlement(
+        run_units((split, election, revocation, price), 1.0),
+        as_of=date(2025, 10, 4))
+    report.check_conservation()
+    records = report.holder_records("ORIGINAL")
+    assert [r.kind for r in records] == [
+        "RETAINED", "CASH_IN_LIEU"]
+    cash = next(r for r in records if r.kind == "CASH_IN_LIEU")
+    assert cash.units == pytest.approx(0.1875)
+    assert cash.cash_amount == pytest.approx(1.575)
+    summary = report.cash_summary()["ORIGINAL"]
+    assert summary["available_cash"] == pytest.approx(1.575)
+    assert summary["adjustments"] == 0.0
+    assert summary["pending_units"] == 0.0
+
+
+def test_cash_settlement_save_restore_and_multi_holder_conservation(tmp_path):
+    transfer_b = RightsTransfer(
+        event_id="TB", to_holder="乙", ratio=0.25,
+        effective_date=date(2025, 9, 1), received_date=date(2025, 9, 1),
+        basis="转让给乙")
+    transfer_c = RightsTransfer(
+        event_id="TC", to_holder="丙", ratio=0.5,
+        effective_date=date(2025, 9, 1), received_date=date(2025, 9, 1),
+        basis="转让给丙")
+    split = UnitChange(
+        event_id="U-FRACTION", effective_date=date(2025, 10, 1),
+        factor=1.25, received_date=date(2025, 10, 1), basis="1拆1.25")
+    elections = tuple(
+        FractionElection(
+            event_id=f"E-{holder}", holder=holder,
+            unit_change_event_id="U-FRACTION", method="CASH",
+            effective_date=date(2025, 10, 1), received_date=date(2025, 10, 1),
+            basis="现金替代")
+        for holder in ("ORIGINAL", "乙", "丙"))
+    price = CashPriceFixing(
+        event_id="P1", unit_change_event_id="U-FRACTION",
+        price_per_unit=8.0, received_date=date(2025, 10, 2), basis="定价")
+    correction = CashPriceFixing(
+        event_id="P2", unit_change_event_id="U-FRACTION",
+        price_per_unit=8.4, received_date=date(2025, 10, 3),
+        corrects_event_id="P1", basis="更正")
+    revocation = ElectionRevocation(
+        event_id="R-ORIGINAL", election_event_id="E-ORIGINAL",
+        portion=0.25, received_date=date(2025, 10, 4), basis="撤回")
+    events = (transfer_b, transfer_c, split, *elections, price, correction, revocation)
+    valuation = run_units(events, 1.0)
+    report = fraction_settlement(valuation, as_of=date(2025, 10, 5))
+    report.check_conservation()
+
+    report_path = tmp_path / "fractions.json"
+    report.save_json(report_path)
+    assert FractionReport.load_json(report_path) == report
+
+    batch_path = tmp_path / "valuation.json"
+    batch = ValuationBatch("B")
+    batch.run(make_contract(events=events, total_units=1.0), make_curve(AS_OF))
+    batch.save_json(batch_path)
+    restored = ValuationBatch.load_json(batch_path).get("FR-1", "C")
+    restored_report = fraction_settlement(restored, as_of=date(2025, 10, 5))
+    restored_report.check_conservation()
+    assert restored_report == report
+
+    summary = restored_report.cash_summary()
+    assert summary["ORIGINAL"]["available_cash"] == pytest.approx(
+        0.3125 * 8.4 * 0.75)
+    assert summary["乙"]["available_cash"] == pytest.approx(0.3125 * 8.4)
+    assert summary["丙"]["available_cash"] == pytest.approx(0.625 * 8.4)
+    total_cash = sum(item["available_cash"] for item in summary.values())
+    active_units = 0.3125 * 0.75 + 0.3125 + 0.625
+    assert total_cash == pytest.approx(active_units * 8.4)
 
 
 def test_rounding_residuals_reconcile_across_holders():

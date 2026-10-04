@@ -12,7 +12,10 @@ from .contract import FixedRateContract
 from .curve import DiscountCurve
 from .floating import FloatingRateContract, MissingFixingError
 from .events import (
+    CashPriceFixing,
+    ElectionRevocation,
     FixingCorrection,
+    FractionElection,
     PartialTermination,
     RightsTransfer,
     TransferRevocation,
@@ -317,6 +320,12 @@ def _from_primitive(value):
             return TransferRevocation(**data)
         if kind == "UnitChange":
             return UnitChange(**data)
+        if kind == "FractionElection":
+            return FractionElection(**data)
+        if kind == "ElectionRevocation":
+            return ElectionRevocation(**data)
+        if kind == "CashPriceFixing":
+            return CashPriceFixing(**data)
         if kind == "Cashflow":
             return Cashflow(**data)
         if kind == "CashflowExplanation":
