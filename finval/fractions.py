@@ -36,6 +36,7 @@ from .events import (
     CashPriceFixing,
     ElectionRevocation,
     FractionElection,
+    UnitChange,
 )
 from .valuation import Valuation
 
@@ -96,9 +97,13 @@ class FractionReport:
             if r.kind == "PENDING_CASH":
                 bucket["pending_units"] += r.units
             elif r.kind == "CASH_IN_LIEU":
-                bucket["available_cash"] += r.cash_amount
+                bucket["available_cash"] += r.cash_amount or 0.0
+            elif r.kind == "REVOCATION_ADJUSTMENT" and r.cash_amount is None:
+                bucket["pending_units"] -= r.units
             elif r.kind in ("PRICE_ADJUSTMENT", "REVOCATION_ADJUSTMENT"):
-                bucket["adjustments"] += r.cash_amount
+                amount = r.cash_amount or 0.0
+                bucket["adjustments"] += amount
+                bucket["available_cash"] += amount
         return {h: {k: round(v, ROUND_DECIMALS) for k, v in bucket.items()}
                 for h, bucket in out.items()}
 
@@ -125,6 +130,9 @@ class FractionReport:
                           "TRANSFER_OUT"):
                 key = (r.unit_change_event_id, r.holder)
                 disposed[key] = disposed.get(key, 0.0) + r.units
+            elif r.kind == "REVOCATION_ADJUSTMENT":
+                key = (r.unit_change_event_id, r.holder)
+                disposed[key] = disposed.get(key, 0.0) - r.units
             if r.kind == "TRANSFER_OUT":
                 transferred_out += r.units
             elif r.kind == "TRANSFER_IN":
@@ -184,20 +192,6 @@ def fraction_settlement(valuation: Valuation, as_of: Optional[date] = None) -> F
     unit_changes = _active_unit_changes(valuation, as_of)
     total_units = getattr(valuation, "total_units", 1.0)
 
-    elections: dict = {}
-    for e in events:
-        if isinstance(e, FractionElection) and e.received_date <= as_of:
-            elections[(e.holder, e.unit_change_event_id)] = e
-    revoked: dict = {}
-    revocation_basis: dict = {}
-    for e in events:
-        if isinstance(e, ElectionRevocation) and e.received_date <= as_of:
-            revoked[e.election_event_id] = revoked.get(e.election_event_id, 0.0) + e.portion
-            revocation_basis[e.election_event_id] = (e.event_id, e.basis)
-    for eid, portion in revoked.items():
-        if portion > 1 + _EPS:
-            raise ValueError(f"选择 {eid} 累计撤回比例超过 1")
-
     generated: list[GeneratedFraction] = []
     records: list[FractionRecord] = []
     residuals: list[float] = []
@@ -216,68 +210,188 @@ def fraction_settlement(valuation: Valuation, as_of: Optional[date] = None) -> F
             event_id=event_id, basis=basis))
         seq += 1
 
-    for uc in unit_changes:
-        factor_after = unit_factor_at(unit_changes, uc.effective_date)
-        shares = _equity_shares(transfers, unit_changes, uc.effective_date, total_units)
-        price_chain = _price_chain(events, uc.event_id, as_of)
-        for holder in sorted(set(shares) | set(removed)):
-            equity = shares.get(holder, 0.0) - removed.get(holder, 0.0)
-            if equity <= _EPS:
-                continue
-            units_after = equity * total_units * factor_after
-            frac = units_after - math.floor(units_after + _EPS)
-            if frac <= _EPS:
-                continue
-            generated.append(GeneratedFraction(uc.event_id, holder, frac))
-            election = elections.get((holder, uc.event_id))
-            if election is not None and election.effective_date < uc.effective_date:
-                election = None   # 选择截止日早于变化生效日，不适用
-            method = election.method if election is not None else "RETAIN"
-            portion = revoked.get(election.event_id, 0.0) if election else 0.0
-            elected_frac = frac * (1 - portion)
-            revoked_frac = frac * portion
-            ratio_denom = total_units * factor_after
+    class Position:
+        def __init__(self, uc, holder, units):
+            self.uc = uc
+            self.holder = holder
+            self.total_units = units
+            self.election = None
+            self.pending_units = 0.0
+            self.cash_units = 0.0
+            self.price = None
+            self.revoked_portion = 0.0
+            self.settled = False
+            self.pending_record = False
 
-            if revoked_frac > _EPS:
-                rev_id, rev_basis = revocation_basis[election.event_id]
-                add(holder, uc.event_id, "RETAINED", revoked_frac,
-                    None, None, rev_id, rev_basis)
-            if elected_frac <= _EPS:
-                continue
-            if method == "RETAIN":
-                add(holder, uc.event_id, "RETAINED", elected_frac,
-                    None, None,
-                    election.event_id if election else None,
-                    election.basis if election else "默认保留累积")
-            elif method == "TRANSFER":
-                removed[holder] = removed.get(holder, 0.0) + elected_frac / ratio_denom
+        def active_units(self):
+            return self.total_units * (1.0 - self.revoked_portion)
+
+    positions: dict = {}
+    elections_by_key: dict = {}
+    revoked_by_election: dict = {}
+    revocation_basis: dict = {}
+    chains = {uc.event_id: _price_chain(events, uc.event_id, as_of)
+              for uc in unit_changes}
+
+    def create_position(uc, holder, units):
+        key = (uc.event_id, holder)
+        pos = Position(uc, holder, units)
+        positions[key] = pos
+        generated.append(GeneratedFraction(uc.event_id, holder, units))
+        election = elections_by_key.get(key)
+        if election is not None and election.effective_date >= uc.effective_date:
+            apply_election(pos, election)
+
+    def remove_equity(holder, units, factor):
+        if units:
+            removed[holder] = removed.get(holder, 0.0) + units / (total_units * factor)
+
+    def restore_equity(holder, units, factor):
+        if units:
+            removed[holder] = removed.get(holder, 0.0) - units / (total_units * factor)
+
+    def known_price(uc_id, day):
+        chain = chains.get(uc_id, ())
+        known = [f for f in chain if f.received_date <= day]
+        return known[-1] if known else None
+
+    def apply_election(pos, election):
+        if pos.election is not None or pos.settled:
+            return
+        pos.election = election
+        pos.revoked_portion = revoked_by_election.get(election.event_id, 0.0)
+        active = pos.active_units()
+        factor = unit_factor_at(unit_changes, pos.uc.effective_date)
+        if election.method == "RETAIN":
+            if active > _EPS:
+                add(pos.holder, pos.uc.event_id, "RETAINED", active,
+                    None, None, election.event_id, election.basis)
+            pos.settled = True
+        elif election.method == "TRANSFER":
+            if active > _EPS:
+                remove_equity(pos.holder, active, factor)
                 removed[election.to_holder] = (
-                    removed.get(election.to_holder, 0.0) - elected_frac / ratio_denom)
-                add(holder, uc.event_id, "TRANSFER_OUT", elected_frac,
+                    removed.get(election.to_holder, 0.0) - active / (total_units * factor))
+                add(pos.holder, pos.uc.event_id, "TRANSFER_OUT", active,
                     None, None, election.event_id, election.basis)
-                add(election.to_holder, uc.event_id, "TRANSFER_IN", elected_frac,
+                add(election.to_holder, pos.uc.event_id, "TRANSFER_IN", active,
                     None, None, election.event_id, election.basis)
-            else:  # CASH
-                removed[holder] = removed.get(holder, 0.0) + elected_frac / ratio_denom
-                if not price_chain:
-                    add(holder, uc.event_id, "PENDING_CASH", elected_frac,
-                        None, None, election.event_id, election.basis)
+            pos.settled = True
+        else:
+            revoked_units = pos.total_units * pos.revoked_portion
+            if revoked_units > _EPS:
+                add(pos.holder, pos.uc.event_id, "RETAINED", revoked_units,
+                    None, None,
+                    revocation_basis[election.event_id][0],
+                    revocation_basis[election.event_id][1])
+            if active <= _EPS:
+                pos.settled = True
+                return
+            fixing = known_price(pos.uc.event_id, election.received_date)
+            if fixing is None:
+                pos.pending_units = active
+                pos.pending_record = True
+            else:
+                pos.cash_units = active
+                pos.price = fixing.price_per_unit
+                remove_equity(pos.holder, active, factor)
+                add(pos.holder, pos.uc.event_id, "CASH_IN_LIEU", active,
+                    fixing.price_per_unit, active * fixing.price_per_unit,
+                    fixing.event_id, fixing.basis)
+
+    timeline = [
+        e for e in events
+        if e.received_date <= as_of
+        and isinstance(e, (FractionElection, CashPriceFixing, ElectionRevocation))
+    ]
+    timeline.extend(unit_changes)
+    timeline.sort(key=lambda e: (e.received_date, e.event_id))
+
+    # 选择、定价、撤回严格按到达顺序逐笔追加；单位变化在其通知到达时建账。
+    for event in timeline:
+        if isinstance(event, FractionElection):
+            key = (event.unit_change_event_id, event.holder)
+            elections_by_key[key] = event
+            pos = positions.get(key)
+            if pos is not None and event.effective_date >= pos.uc.effective_date:
+                apply_election(pos, event)
+        elif isinstance(event, ElectionRevocation):
+            revoked_by_election[event.election_event_id] = (
+                revoked_by_election.get(event.election_event_id, 0.0) + event.portion)
+            total_portion = revoked_by_election[event.election_event_id]
+            if total_portion > 1 + _EPS:
+                raise ValueError(f"选择 {event.election_event_id} 累计撤回比例超过 1")
+            revocation_basis[event.election_event_id] = (event.event_id, event.basis)
+            for pos in positions.values():
+                if pos.election is None or pos.election.event_id != event.election_event_id:
                     continue
-                base = price_chain[0]
-                add(holder, uc.event_id, "CASH_IN_LIEU", elected_frac,
-                    base.price_per_unit, elected_frac * base.price_per_unit,
-                    base.event_id, base.basis)
-                for prev, nxt in zip(price_chain, price_chain[1:]):
-                    add(holder, uc.event_id, "PRICE_ADJUSTMENT", elected_frac,
-                        nxt.price_per_unit,
-                        elected_frac * (nxt.price_per_unit - prev.price_per_unit),
-                        nxt.event_id, nxt.basis)
-                if revoked_frac > _EPS:
-                    final_price = price_chain[-1].price_per_unit
-                    rev_id, rev_basis = revocation_basis[election.event_id]
-                    add(holder, uc.event_id, "REVOCATION_ADJUSTMENT", revoked_frac,
-                        final_price, -(revoked_frac * final_price),
-                        rev_id, rev_basis)
+                old_portion = pos.revoked_portion
+                new_portion = min(total_portion, 1.0)
+                delta_portion = max(0.0, new_portion - old_portion)
+                revoked_units = pos.total_units * delta_portion
+                if revoked_units <= _EPS:
+                    continue
+                pos.revoked_portion = new_portion
+                factor = unit_factor_at(unit_changes, pos.uc.effective_date)
+                add(pos.holder, pos.uc.event_id, "RETAINED", revoked_units,
+                    None, None, event.event_id, event.basis)
+                if pos.pending_units > _EPS:
+                    delta = min(revoked_units, pos.pending_units)
+                    pos.pending_units -= delta
+                if pos.cash_units > _EPS:
+                    delta = min(revoked_units, pos.cash_units)
+                    pos.cash_units -= delta
+                    restore_equity(pos.holder, delta, factor)
+                    add(pos.holder, pos.uc.event_id, "REVOCATION_ADJUSTMENT", delta,
+                        pos.price, -(delta * pos.price),
+                        event.event_id, event.basis)
+                if pos.pending_units <= _EPS and pos.cash_units <= _EPS:
+                    pos.settled = True
+        elif isinstance(event, CashPriceFixing):
+            for pos in positions.values():
+                if pos.uc.event_id != event.unit_change_event_id or pos.election is None:
+                    continue
+                factor = unit_factor_at(unit_changes, pos.uc.effective_date)
+                if event.corrects_event_id is None:
+                    if pos.pending_units > _EPS:
+                        units = pos.pending_units
+                        pos.pending_units = 0.0
+                        pos.cash_units = units
+                        pos.price = event.price_per_unit
+                        remove_equity(pos.holder, units, factor)
+                        add(pos.holder, pos.uc.event_id, "CASH_IN_LIEU", units,
+                            event.price_per_unit, units * event.price_per_unit,
+                            event.event_id, event.basis)
+                elif pos.cash_units > _EPS and pos.price is not None:
+                    chain = chains[pos.uc.event_id]
+                    previous = next(
+                        (f for f in chain if f.event_id == event.corrects_event_id), None)
+                    if previous is not None and abs(pos.price - previous.price_per_unit) <= _EPS:
+                        add(pos.holder, pos.uc.event_id, "PRICE_ADJUSTMENT", pos.cash_units,
+                            event.price_per_unit,
+                            pos.cash_units * (event.price_per_unit - previous.price_per_unit),
+                            event.event_id, event.basis)
+                        pos.price = event.price_per_unit
+        elif isinstance(event, UnitChange):
+            factor_after = unit_factor_at(unit_changes, event.effective_date)
+            shares = _equity_shares(transfers, unit_changes, event.effective_date, total_units)
+            for holder in sorted(set(shares) | set(removed)):
+                equity = shares.get(holder, 0.0) - removed.get(holder, 0.0)
+                if equity <= _EPS:
+                    continue
+                units_after = equity * total_units * factor_after
+                frac = units_after - math.floor(units_after + _EPS)
+                if frac > _EPS:
+                    create_position(event, holder, frac)
+
+    # 截止 as_of 没有有效选择的零碎单位，仍按默认保留累积建账。
+    for pos in positions.values():
+        if pos.pending_units > _EPS and pos.pending_record:
+            add(pos.holder, pos.uc.event_id, "PENDING_CASH", pos.pending_units,
+                None, None, pos.election.event_id, pos.election.basis)
+        elif pos.election is None and not pos.settled:
+            add(pos.holder, pos.uc.event_id, "RETAINED",
+                pos.total_units, None, None, None, "默认保留累积")
 
     return FractionReport(
         contract_id=valuation.contract_id,

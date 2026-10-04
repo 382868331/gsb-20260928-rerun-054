@@ -163,6 +163,168 @@ def test_cash_pending_then_priced_then_corrected():
     corrected.check_conservation()
 
 
+def test_correction_then_partial_revocation_keeps_original_allocation():
+    unit_change = UnitChange(
+        event_id="U1", effective_date=date(2025, 10, 1), factor=0.25,
+        received_date=date(2025, 10, 1), basis="4并1")
+    election = FractionElection(
+        event_id="E1", holder="ORIGINAL", unit_change_event_id="U1",
+        method="CASH", effective_date=date(2025, 10, 1),
+        received_date=date(2025, 10, 1), basis="现金替代选择")
+    first_price = CashPriceFixing(
+        event_id="P1", unit_change_event_id="U1", price_per_unit=7.2,
+        received_date=date(2025, 10, 20), basis="首次定价")
+    corrected_price = CashPriceFixing(
+        event_id="P2", unit_change_event_id="U1", price_per_unit=8.4,
+        received_date=date(2025, 11, 1), basis="价格更正",
+        corrects_event_id="P1")
+    revocation = ElectionRevocation(
+        event_id="R1", election_event_id="E1", portion=0.25,
+        received_date=date(2025, 11, 10), basis="撤回四分之一")
+    events = (unit_change, election, first_price, corrected_price, revocation)
+    contract = make_contract(events=events, total_units=1.0)
+    valuation = ValuationBatch("B").run(contract, make_curve(AS_OF))
+    report = fraction_settlement(valuation, as_of=AS_OF)
+    report.check_conservation()
+
+    records = report.holder_records("ORIGINAL")
+    assert [r.kind for r in records] == [
+        "CASH_IN_LIEU", "PRICE_ADJUSTMENT", "RETAINED",
+        "REVOCATION_ADJUSTMENT"]
+    cash, price_adjustment, retained, clawback = records
+    assert cash.units == pytest.approx(0.25)
+    assert cash.cash_amount == pytest.approx(1.8)
+    assert price_adjustment.units == pytest.approx(0.25)
+    assert price_adjustment.exact_cash == pytest.approx(0.3)
+    assert retained.units == pytest.approx(0.0625)
+    assert clawback.units == pytest.approx(0.0625)
+    assert clawback.price == pytest.approx(8.4)
+    assert clawback.exact_cash == pytest.approx(-0.525)
+    assert report.cash_summary()["ORIGINAL"] == {
+        "pending_units": 0.0,
+        "available_cash": pytest.approx(1.575),
+        "adjustments": pytest.approx(-0.225),
+    }
+
+
+def test_revocation_before_pricing_only_restores_units():
+    election = FractionElection(
+        event_id="E1", holder="乙", unit_change_event_id="U1",
+        method="CASH", effective_date=date(2025, 10, 1),
+        received_date=date(2025, 10, 1), basis="现金替代选择")
+    revocation = ElectionRevocation(
+        event_id="R1", election_event_id="E1", portion=0.25,
+        received_date=date(2025, 10, 10), basis="撤回前未定价")
+    price = CashPriceFixing(
+        event_id="P1", unit_change_event_id="U1", price_per_unit=8.4,
+        received_date=date(2025, 10, 20), basis="撤回后定价")
+    report = fraction_settlement(
+        run((T_YI, MERGE1, election, revocation, price)), as_of=AS_OF)
+    report.check_conservation()
+
+    records = report.holder_records("乙")
+    assert [r.kind for r in records] == ["RETAINED", "CASH_IN_LIEU"]
+    retained, cash = records
+    assert retained.units == pytest.approx(1 / 36)
+    assert cash.units == pytest.approx(1 / 12)
+    assert cash.cash_amount == pytest.approx((1 / 12) * 8.4)
+    assert not [r for r in records if r.kind == "REVOCATION_ADJUSTMENT"]
+    assert report.cash_summary()["乙"]["adjustments"] == 0.0
+
+
+def test_consecutive_price_corrections_append_each_delta_once():
+    election = FractionElection(
+        event_id="E1", holder="乙", unit_change_event_id="U1",
+        method="CASH", effective_date=date(2025, 10, 1),
+        received_date=date(2025, 10, 1), basis="现金替代选择")
+    prices = (
+        CashPriceFixing(event_id="P1", unit_change_event_id="U1",
+                        price_per_unit=7.2, received_date=date(2025, 10, 20),
+                        basis="首次定价"),
+        CashPriceFixing(event_id="P2", unit_change_event_id="U1",
+                        price_per_unit=8.4, received_date=date(2025, 11, 1),
+                        basis="第一次更正", corrects_event_id="P1"),
+        CashPriceFixing(event_id="P3", unit_change_event_id="U1",
+                        price_per_unit=8.0, received_date=date(2025, 11, 2),
+                        basis="第二次更正", corrects_event_id="P2"),
+    )
+    report = fraction_settlement(run((T_YI, MERGE1, election) + prices), as_of=AS_OF)
+    adjustments = [r for r in report.holder_records("乙")
+                   if r.kind == "PRICE_ADJUSTMENT"]
+    assert [r.event_id for r in adjustments] == ["P2", "P3"]
+    assert adjustments[0].exact_cash == pytest.approx((1 / 9) * 1.2)
+    assert adjustments[1].exact_cash == pytest.approx((1 / 9) * -0.4)
+    assert report.cash_summary()["乙"]["available_cash"] == pytest.approx(
+        (1 / 9) * 8.0)
+
+
+def test_correction_and_partial_revocation_conserve_across_holders():
+    t_bing = RightsTransfer(
+        event_id="T-BING", to_holder="丙", ratio=1 / 3,
+        effective_date=date(2025, 9, 1), received_date=date(2025, 9, 1),
+        basis="转让协议")
+    elections = tuple(
+        FractionElection(
+            event_id=f"E-{holder}", holder=holder,
+            unit_change_event_id="U1", method="CASH",
+            effective_date=date(2025, 10, 1),
+            received_date=date(2025, 10, 1), basis="现金替代选择")
+        for holder in ("乙", "丙", "ORIGINAL"))
+    events = (
+        T_YI, t_bing, MERGE1,
+        *elections,
+        CashPriceFixing(event_id="P1", unit_change_event_id="U1",
+                        price_per_unit=7.2, received_date=date(2025, 10, 20),
+                        basis="首次定价"),
+        CashPriceFixing(event_id="P2", unit_change_event_id="U1",
+                        price_per_unit=8.4, received_date=date(2025, 11, 1),
+                        basis="价格更正", corrects_event_id="P1"),
+        ElectionRevocation(event_id="R-ALL", election_event_id="E-乙",
+                           portion=0.25, received_date=date(2025, 11, 5),
+                           basis="乙撤回"),
+        ElectionRevocation(event_id="R-BING", election_event_id="E-丙",
+                           portion=0.25, received_date=date(2025, 11, 5),
+                           basis="丙撤回"),
+        ElectionRevocation(event_id="R-ORIG", election_event_id="E-ORIGINAL",
+                           portion=0.25, received_date=date(2025, 11, 5),
+                           basis="ORIGINAL撤回"),
+    )
+    report = fraction_settlement(run(events), as_of=AS_OF)
+    report.check_conservation()
+
+    summaries = report.cash_summary()
+    for holder in ("乙", "丙", "ORIGINAL"):
+        assert summaries[holder]["available_cash"] == pytest.approx(0.7)
+        assert summaries[holder]["adjustments"] == pytest.approx(
+            (1 / 9) * 1.2 - (1 / 36) * 8.4)
+    assert sum(v["available_cash"] for v in summaries.values()) == pytest.approx(2.1)
+    assert sum(report.retained_units().values()) == pytest.approx(3 / 36)
+
+
+def test_fraction_settlement_survives_valuation_save_restore(tmp_path):
+    election = FractionElection(
+        event_id="E1", holder="ORIGINAL", unit_change_event_id="U1",
+        method="CASH", effective_date=date(2025, 10, 1),
+        received_date=date(2025, 10, 1), basis="现金替代选择")
+    unit_change = UnitChange(
+        event_id="U1", effective_date=date(2025, 10, 1), factor=0.25,
+        received_date=date(2025, 10, 1), basis="4并1")
+    price = CashPriceFixing(
+        event_id="P1", unit_change_event_id="U1", price_per_unit=8.4,
+        received_date=date(2025, 10, 20), basis="定价")
+    contract = make_contract(
+        events=(unit_change, election, price), total_units=1.0)
+    batch = ValuationBatch("B")
+    batch.run(contract, make_curve(AS_OF))
+    path = tmp_path / "valuation.json"
+    batch.save_json(path)
+    restored = ValuationBatch.load_json(path).get("FR-1", "C")
+    expected = fraction_settlement(batch.get("FR-1", "C"), as_of=AS_OF)
+    actual = fraction_settlement(restored, as_of=AS_OF)
+    assert actual.records == expected.records
+    assert actual.cash_summary() == expected.cash_summary()
+
+
 def test_partial_election_revocation_tracked_adjustment():
     election = FractionElection(
         event_id="E1", holder="乙", unit_change_event_id="U1",
@@ -187,12 +349,12 @@ def test_partial_election_revocation_tracked_adjustment():
     after.check_conservation()
     yi = after.holder_records("乙")
     kinds = [r.kind for r in yi]
-    assert kinds == ["RETAINED", "CASH_IN_LIEU", "REVOCATION_ADJUSTMENT"]
-    retained, cash, clawback = yi
+    assert kinds == ["CASH_IN_LIEU", "RETAINED", "REVOCATION_ADJUSTMENT"]
+    cash, retained, clawback = yi
     assert retained.units == pytest.approx(1 / 18)
     assert retained.event_id == "R1"
-    assert cash.units == pytest.approx(1 / 18)
-    assert cash.cash_amount == pytest.approx(0.55)
+    assert cash.units == pytest.approx(1 / 9)
+    assert cash.cash_amount == pytest.approx(1.1)
     assert clawback.exact_cash == pytest.approx(-0.55)
     assert clawback.event_id == "R1"
     summary = after.cash_summary()
