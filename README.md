@@ -26,6 +26,11 @@
 - **单位拆分/合并**：`UnitChange` 记录单位口径变化（`factor>1` 拆分、`0<factor<1` 合并），与经济权益比例分别记录；`holder_positions()` 给出某知识时点下各持有人的单位数与原合约权益比例，单位变多不会凭空增加应收金额。
 - **固定单位 vs 固定比例转让**：`RightsTransfer` 的 `units` 与 `ratio` 二选一；固定单位按转让生效日的单位口径折算为权益比例，之后的拆分/合并不改变其对应权益，两种约定始终可分别追查。
 - **舍入归属**：每个持有人份额独立舍入到最小可分单位（6 位小数），未分配余量在 `contract_view()` 的 `unallocated_residual` 单列，不与任何持有人份额混同。
+- **零碎权益选择**：拆并产生零碎单位时，持有人可提交 `FractionElection` 选择 KEEP（保留可累积零碎单位，默认）、CASH（现金替代）或 TRANSFER（余量转给另一持有人）；选择须在该次拆并的 `election_deadline`（缺省为生效日，含当天）前到达，逾期按 KEEP 处理。
+- **同日生效依据**：拆并、份额转移、选择截止同日时，先按拆并生效产生零碎单位并结算选择，份额转移按拆并后单位口径折算，撤回回补最后；内部一律用精确数量续算权益，显示舍入不回用于计算。
+- **待定与可用现金**：`CashPriceFixing` 定价可晚于份额变化；价格未知期间零碎单位为 PENDING_CASH 待定现金权益，定价后转为可用现金（`available_cash`），两者分列。
+- **余量对账**：现金按 6 位小数舍入的余量按拆并批次记入 `residual_summary()`，可核对总和，不并入任何持有人也不重复分配；`check_conservation()` 校验单位与现金双重守恒。
+- **可追踪调整**：更正价格（同一拆并的再次定价）或 `ElectionRevocation`（支持 `fraction` 部分撤回）到达时若原选择已执行，原 CASH/转移记录保持不变，另以 ADJUSTMENT 记录体现差额并回补单位。
 - **分配对账**：`allocate()` 生成 `AllocationReport`，提供原合约视角（`contract_view`）与各持有人视角（`holder_view` / `totals_by_holder`），`check_conservation()` 校验总额守恒；报告可 `save_json` / `load_json`，重开后各方已收/应收/补偿互不覆盖。
 - **存档重开**：`ValuationBatch.save_json()` / `load_json()` 保存当前日程、原始日程快照、历史结论、解释与事件依据。
 
@@ -154,6 +159,38 @@ cur.save_json("allocation.json")
 
 - 多次转让交叠时，任一持有人累计分出比例超过其原权益即抛出 `ValueError`。
 - `TransferRevocation` 撤销已达成的转让：撤销到达前的历史结论不变，当前视角回补差额。
+
+### 零碎权益选择与现金替代
+
+```python
+from finval import (
+    CashPriceFixing, ElectionRevocation, FractionElection, fraction_ledger,
+)
+
+merge = UnitChange(
+    event_id="U2", effective_date=date(2025, 11, 1), factor=1 / 3,
+    received_date=date(2025, 11, 1), basis="3并1",
+    election_deadline=date(2025, 11, 1))     # 选择截止日，缺省为生效日
+election = FractionElection(
+    event_id="E1", holder="乙", unit_change_event_id="U2", choice="CASH",
+    received_date=date(2025, 10, 30), basis="现金替代选择")
+price = CashPriceFixing(                     # 价格可晚于份额变化确定
+    event_id="P1", unit_change_event_id="U2", price_per_unit=3.0,
+    received_date=date(2025, 11, 10), basis="定价通知")
+contract = replace(contract, events=contract.events + (merge, election, price))
+valuation = batch.run(contract, curve)
+
+ledger = fraction_ledger(valuation, as_of=date(2025, 11, 15))
+print(ledger.pending_cash_units("乙"))       # 价格未知期间的待定现金权益
+print(ledger.available_cash("乙"))           # 已定价可用现金
+print(ledger.residual_summary())             # 各批次舍入余量与总和
+ledger.check_conservation()                  # 单位与现金双重守恒
+```
+
+- 再次定价视为更正：原 CASH 记录不变，差额以 ADJUSTMENT 记录体现。
+- `ElectionRevocation(fraction=0.5)` 部分撤回：已执行部分以 ADJUSTMENT
+  冲回现金并把单位回补给持有人，回补单位自撤回到达日起参与后续拆并。
+- TRANSFER 选择把零碎单位转给 `to_holder`，跨持有人转移在台账中双向可追。
 
 ### 单位拆分/合并与持仓查询
 
