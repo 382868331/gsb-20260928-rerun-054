@@ -4,7 +4,10 @@ from .calendar import Calendar, BusinessDayConvention
 from .conventions import DayCount, Frequency, UnsupportedConventionError
 from .contract import FixedRateContract, StubType
 from .events import (
+    CashPriceFixing,
+    ElectionRevocation,
     FixingCorrection,
+    FractionElection,
     PartialTermination,
     RightsTransfer,
     TransferRevocation,
@@ -24,6 +27,12 @@ from .allocation import (
     holder_positions,
     unit_factor_at,
 )
+from .fractions import (
+    FractionRecord,
+    FractionReport,
+    GeneratedFraction,
+    fraction_settlement,
+)
 
 __all__ = [
     "Calendar",
@@ -36,6 +45,9 @@ __all__ = [
     "StubType",
     "MissingFixingError",
     "FixingCorrection",
+    "CashPriceFixing",
+    "ElectionRevocation",
+    "FractionElection",
     "PartialTermination",
     "RightsTransfer",
     "TransferRevocation",
@@ -56,4 +68,8 @@ __all__ = [
     "allocate",
     "holder_positions",
     "unit_factor_at",
+    "FractionRecord",
+    "FractionReport",
+    "GeneratedFraction",
+    "fraction_settlement",
 ]

@@ -26,6 +26,8 @@
 - **单位拆分/合并**：`UnitChange` 记录单位口径变化（`factor>1` 拆分、`0<factor<1` 合并），与经济权益比例分别记录；`holder_positions()` 给出某知识时点下各持有人的单位数与原合约权益比例，单位变多不会凭空增加应收金额。
 - **固定单位 vs 固定比例转让**：`RightsTransfer` 的 `units` 与 `ratio` 二选一；固定单位按转让生效日的单位口径折算为权益比例，之后的拆分/合并不改变其对应权益，两种约定始终可分别追查。
 - **舍入归属**：每个持有人份额独立舍入到最小可分单位（6 位小数），未分配余量在 `contract_view()` 的 `unallocated_residual` 单列，不与任何持有人份额混同。
+- **零碎权益选择**：单位拆并产生零碎单位时，`FractionElection` 支持 `RETAIN` 保留可累积 / `CASH` 现金替代 / `TRANSFER` 转给另一持有人；`fraction_settlement()` 生成 `FractionReport`，内部一律用未舍入精确值计算，落账现金才舍入，余量逐笔记录并汇总于 `total_residual` 供核对。
+- **待定与可用现金**：现金替代价格（`CashPriceFixing`）可晚于份额变化到达；定价前为 `PENDING_CASH` 待定权益，定价后生成 `CASH_IN_LIEU` 可用现金；价格更正只追加 `PRICE_ADJUSTMENT`，选择撤回（`ElectionRevocation`，可部分）只追加 `REVOCATION_ADJUSTMENT`，已完成的分配记录不改写。
 - **分配对账**：`allocate()` 生成 `AllocationReport`，提供原合约视角（`contract_view`）与各持有人视角（`holder_view` / `totals_by_holder`），`check_conservation()` 校验总额守恒；报告可 `save_json` / `load_json`，重开后各方已收/应收/补偿互不覆盖。
 - **存档重开**：`ValuationBatch.save_json()` / `load_json()` 保存当前日程、原始日程快照、历史结论、解释与事件依据。
 
@@ -184,6 +186,39 @@ t_units = RightsTransfer(event_id="T2", to_holder="丙", units=30.0,
 - 拆分/合并只改变单位数，不改变权益比例；迟到的拆分通知不改动已付款项的金钱归属，若改变未付款项解释则以 `COMPENSATION` 记录差额。
 - 每笔 `HolderShare.unit_factor` 标明该笔现金流采用的单位口径（变化前/后）。
 - `contract_view()` 逐笔列示总额、已分配合计与 `unallocated_residual` 舍入余量；`check_conservation()` 校验 份额 + 余量 = 原金额。
+
+### 零碎权益选择与现金替代
+
+```python
+from finval import FractionElection, CashPriceFixing, ElectionRevocation, fraction_settlement
+
+# 3 并 1 产生零碎单位；乙选择现金替代，丙把余量转给 ORIGINAL
+elections = (
+    FractionElection(event_id="E1", holder="乙", unit_change_event_id="U1",
+                     method="CASH",
+                     effective_date=date(2025, 10, 1),   # 选择截止日，同日即有效
+                     received_date=date(2025, 10, 1), basis="现金替代选择"),
+    FractionElection(event_id="E2", holder="丙", unit_change_event_id="U1",
+                     method="TRANSFER", to_holder="ORIGINAL",
+                     effective_date=date(2025, 10, 1),
+                     received_date=date(2025, 10, 1), basis="余量转让协议"),
+)
+price = CashPriceFixing(event_id="P1", unit_change_event_id="U1",
+                        price_per_unit=9.9,
+                        received_date=date(2025, 10, 20), basis="管理人定价公告")
+contract = replace(contract, events=contract.events + elections + (price,))
+valuation = batch.run(contract, curve)
+
+report = fraction_settlement(valuation, as_of=date(2025, 12, 1))
+report.check_conservation()          # 单位与资金双重守恒
+print(report.cash_summary())         # 待定单位 / 可用现金 / 调整 分列
+print(report.retained_units())       # 各持有人保留累积的零碎单位
+print(report.total_residual)         # 舍入余量总和，可逐笔核对
+```
+
+- 同日事件按 `(effective_date, received_date, event_id)` 确定生效顺序；选择截止日不早于单位变化生效日（含同日）才适用，未选择默认 `RETAIN`。
+- 价格未知期间 `cash_summary()` 的 `pending_units` 与 `available_cash` 严格区分；价格更正用 `CashPriceFixing(corrects_event_id=...)` 链接，只产生 `PRICE_ADJUSTMENT`。
+- `ElectionRevocation(portion=0.5)` 部分撤回：被撤回部分恢复保留累积，已分配现金以 `REVOCATION_ADJUSTMENT` 追回，原 `CASH_IN_LIEU` 记录不变。
 
 ## 测试
 

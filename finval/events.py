@@ -1,4 +1,4 @@
-"""历史事件：定盘更正、部分提前终止、权益转让/撤销与单位拆并。"""
+"""历史事件：定盘更正、部分提前终止、权益转让/撤销、单位拆并与零碎权益选择。"""
 
 from __future__ import annotations
 
@@ -112,3 +112,72 @@ class UnitChange:
     @property
     def kind(self) -> str:
         return "SPLIT" if self.factor > 1 else "MERGE"
+
+
+@dataclass(frozen=True)
+class FractionElection:
+    """零碎权益选择：单位拆并产生零碎单位时的处理方式。
+
+    method: RETAIN 保留可累积 / CASH 现金替代 / TRANSFER 转给另一持有人。
+    effective_date 为选择截止日：单位变化生效日不晚于截止日（含同日）时
+    该选择生效；received_date 为收到选择的时刻。未作选择时默认 RETAIN。
+    """
+
+    event_id: str
+    holder: str
+    unit_change_event_id: str
+    method: str
+    effective_date: date
+    received_date: date
+    basis: str
+    to_holder: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.method not in ("RETAIN", "CASH", "TRANSFER"):
+            raise ValueError(f"未知零碎权益处理方式: {self.method!r}")
+        if self.method == "TRANSFER":
+            if self.to_holder is None:
+                raise ValueError("TRANSFER 选择必须给出 to_holder")
+            if self.to_holder == self.holder:
+                raise ValueError("零碎权益不能转给自己")
+        elif self.to_holder is not None:
+            raise ValueError("非 TRANSFER 选择不能给出 to_holder")
+
+
+@dataclass(frozen=True)
+class ElectionRevocation:
+    """撤回已达成的零碎权益选择（可部分撤回）。
+
+    portion in (0,1] 为撤回比例，被撤回部分恢复为保留累积；
+    已完成的现金分配不改写，差额以 REVOCATION_ADJUSTMENT 调整记录体现。
+    """
+
+    event_id: str
+    election_event_id: str
+    portion: float
+    received_date: date
+    basis: str
+
+    def __post_init__(self) -> None:
+        if not 0 < self.portion <= 1:
+            raise ValueError("撤回比例必须在 (0, 1] 区间")
+
+
+@dataclass(frozen=True)
+class CashPriceFixing:
+    """现金替代价格：可晚于份额变化确定；更正只产生新定价事件。
+
+    corrects_event_id 指向被更正的定价事件；更正在分配台账中体现为
+    PRICE_ADJUSTMENT 调整记录，原 CASH_IN_LIEU 记录保持不变。
+    """
+
+    event_id: str
+    unit_change_event_id: str
+    price_per_unit: float
+    received_date: date
+    basis: str
+    corrects_event_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.price_per_unit <= 0:
+            raise ValueError("现金替代价格必须为正")
