@@ -16,6 +16,8 @@ from .events import (
     ElectionRevocation,
     FixingCorrection,
     FractionElection,
+    FractionPool,
+    FractionPoolExecution,
     PartialTermination,
     RightsTransfer,
     TransferRevocation,
@@ -326,6 +328,10 @@ def _from_primitive(value):
             return ElectionRevocation(**data)
         if kind == "CashPriceFixing":
             return CashPriceFixing(**data)
+        if kind == "FractionPool":
+            return FractionPool(**data)
+        if kind == "FractionPoolExecution":
+            return FractionPoolExecution(**data)
         if kind == "Cashflow":
             return Cashflow(**data)
         if kind == "CashflowExplanation":

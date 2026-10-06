@@ -27,6 +27,7 @@
 - **固定单位 vs 固定比例转让**：`RightsTransfer` 的 `units` 与 `ratio` 二选一；固定单位按转让生效日的单位口径折算为权益比例，之后的拆分/合并不改变其对应权益，两种约定始终可分别追查。
 - **舍入归属**：每个持有人份额独立舍入到最小可分单位（6 位小数），未分配余量在 `contract_view()` 的 `unallocated_residual` 单列，不与任何持有人份额混同。
 - **零碎权益选择**：单位拆并产生零碎单位时，`FractionElection` 支持 `RETAIN` 保留可累积 / `CASH` 现金替代 / `TRANSFER` 转给另一持有人；`fraction_settlement()` 生成 `FractionReport`，内部一律用未舍入精确值计算，落账现金才舍入，余量逐笔记录并汇总于 `total_residual` 供核对。
+- **零碎权益汇总处置**：`method="POOL"` 绑定 `FractionPool` 批次后，可合并出售或统一补偿；`FractionPoolExecution` 按各持有人实际参与的精确来源份额分配成交现金和费用。最小货币余缺采用可复核的 `LARGEST_REMAINDER_UNITS` 最大余数规则；成交前撤回重算参与份额，成交后撤回只形成追加追回，迟到价格修订只形成追加调整。`processed_notification_ids` 保存已处理通知，重开后重复通知不再分配。
 - **待定与可用现金**：现金替代价格（`CashPriceFixing`）可晚于份额变化到达；定价前为 `PENDING_CASH` 待定权益，定价后生成 `CASH_IN_LIEU` 可用现金；价格更正只追加 `PRICE_ADJUSTMENT`，选择撤回（`ElectionRevocation`，可部分）只追加 `REVOCATION_ADJUSTMENT`，已完成的分配记录不改写。
 - **分配对账**：`allocate()` 生成 `AllocationReport`，提供原合约视角（`contract_view`）与各持有人视角（`holder_view` / `totals_by_holder`），`check_conservation()` 校验总额守恒；报告可 `save_json` / `load_json`，重开后各方已收/应收/补偿互不覆盖。
 - **存档重开**：`ValuationBatch.save_json()` / `load_json()` 保存当前日程、原始日程快照、历史结论、解释与事件依据。
@@ -190,7 +191,10 @@ t_units = RightsTransfer(event_id="T2", to_holder="丙", units=30.0,
 ### 零碎权益选择与现金替代
 
 ```python
-from finval import FractionElection, CashPriceFixing, ElectionRevocation, fraction_settlement
+from finval import (
+    FractionElection, FractionPool, FractionPoolExecution,
+    CashPriceFixing, ElectionRevocation, fraction_settlement,
+)
 
 # 3 并 1 产生零碎单位；乙选择现金替代，丙把余量转给 ORIGINAL
 elections = (
@@ -219,6 +223,39 @@ print(report.total_residual)         # 舍入余量总和，可逐笔核对
 - 同日事件按 `(effective_date, received_date, event_id)` 确定生效顺序；选择截止日不早于单位变化生效日（含同日）才适用，未选择默认 `RETAIN`。
 - 价格未知期间 `cash_summary()` 的 `pending_units` 与 `available_cash` 严格区分；价格更正用 `CashPriceFixing(corrects_event_id=...)` 链接，只产生 `PRICE_ADJUSTMENT`。
 - `ElectionRevocation(portion=0.5)` 部分撤回：被撤回部分恢复保留累积，已分配现金以 `REVOCATION_ADJUSTMENT` 追回，原 `CASH_IN_LIEU` 记录不变。
+
+跨持有人汇总出售/统一补偿使用同一批次号：
+
+```python
+pool = FractionPool(
+    event_id="POOL-N1", pool_id="POOL-1",
+    unit_change_event_id="U1",
+    cutoff_date=date(2025, 10, 5),
+    received_date=date(2025, 10, 1),
+    method="SALE",                 # 或 COMPENSATION
+    basis="零碎份额汇总出售通知",
+)
+election = FractionElection(
+    event_id="E-POOL-1", holder="乙",
+    unit_change_event_id="U1", method="POOL", pool_id="POOL-1",
+    effective_date=date(2025, 10, 5),
+    received_date=date(2025, 10, 2), basis="参加汇总")
+execution = FractionPoolExecution(
+    event_id="X1", pool_id="POOL-1",
+    gross_amount=128.37, fee_amount=1.20,
+    effective_date=date(2025, 10, 6),
+    received_date=date(2025, 10, 6),
+    rounding_rule="LARGEST_REMAINDER_UNITS",
+    basis="成交到账通知")
+
+report = fraction_settlement(valuation, as_of=date(2025, 10, 7))
+report.check_conservation()
+print(report.pool_summary())
+print(report.processed_notification_ids)
+```
+
+- 成交完成前的 `ElectionRevocation` 从参与基数中剔除；成交完成后的撤回不改写原始 `POOL_PROCEEDS` / `POOL_FEE`，只追加追回和恢复保留记录。
+- 迟到修订使用新的 `FractionPoolExecution(event_id=..., corrects_event_id="X1")`，只对撤回后的剩余参与份额追加 `POOL_ADJUSTMENT` / `POOL_FEE_ADJUSTMENT`；同一事件号重复到达不会再次分配。
 
 ## 测试
 

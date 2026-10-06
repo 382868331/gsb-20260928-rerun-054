@@ -118,7 +118,8 @@ class UnitChange:
 class FractionElection:
     """零碎权益选择：单位拆并产生零碎单位时的处理方式。
 
-    method: RETAIN 保留可累积 / CASH 现金替代 / TRANSFER 转给另一持有人。
+    method: RETAIN 保留可累积 / CASH 现金替代 / TRANSFER 转给另一持有人 /
+    POOL 参加指定零碎权益汇总批次。
     effective_date 为选择截止日：单位变化生效日不晚于截止日（含同日）时
     该选择生效；received_date 为收到选择的时刻。未作选择时默认 RETAIN。
     """
@@ -131,17 +132,70 @@ class FractionElection:
     received_date: date
     basis: str
     to_holder: Optional[str] = None
+    pool_id: Optional[str] = None
 
     def __post_init__(self) -> None:
-        if self.method not in ("RETAIN", "CASH", "TRANSFER"):
+        if self.method not in ("RETAIN", "CASH", "TRANSFER", "POOL"):
             raise ValueError(f"未知零碎权益处理方式: {self.method!r}")
         if self.method == "TRANSFER":
             if self.to_holder is None:
                 raise ValueError("TRANSFER 选择必须给出 to_holder")
             if self.to_holder == self.holder:
                 raise ValueError("零碎权益不能转给自己")
-        elif self.to_holder is not None:
-            raise ValueError("非 TRANSFER 选择不能给出 to_holder")
+            if self.pool_id is not None:
+                raise ValueError("TRANSFER 选择不能给出 pool_id")
+        elif self.method == "POOL":
+            if self.pool_id is None:
+                raise ValueError("POOL 选择必须给出 pool_id")
+            if self.to_holder is not None:
+                raise ValueError("POOL 选择不能给出 to_holder")
+        elif self.to_holder is not None or self.pool_id is not None:
+            raise ValueError("非 TRANSFER/POOL 选择不能给出目标")
+
+
+@dataclass(frozen=True)
+class FractionPool:
+    """同一证券零碎份额的跨持有人汇总处置批次。"""
+
+    event_id: str
+    pool_id: str
+    unit_change_event_id: str
+    cutoff_date: date
+    received_date: date
+    basis: str
+    method: str = "SALE"   # SALE 合并出售 / COMPENSATION 指定批次统一补偿
+
+    def __post_init__(self) -> None:
+        if self.method not in ("SALE", "COMPENSATION"):
+            raise ValueError("零碎汇总方式必须是 SALE 或 COMPENSATION")
+        if self.cutoff_date < self.received_date:
+            raise ValueError("汇总截止日不能早于汇总通知到达日")
+
+
+@dataclass(frozen=True)
+class FractionPoolExecution:
+    """汇总批次的成交/补偿到账通知；更正只形成追加调整。"""
+
+    event_id: str
+    pool_id: str
+    gross_amount: float
+    fee_amount: float
+    effective_date: date
+    received_date: date
+    basis: str
+    corrects_event_id: Optional[str] = None
+    rounding_rule: str = "LARGEST_REMAINDER_UNITS"
+
+    def __post_init__(self) -> None:
+        if self.gross_amount < 0 or self.fee_amount < 0:
+            raise ValueError("汇总成交金额和费用不能为负")
+        if self.fee_amount > self.gross_amount + 1e-12:
+            raise ValueError("汇总费用不能超过成交总额")
+        if self.rounding_rule != "LARGEST_REMAINDER_UNITS":
+            raise ValueError("未知最小货币单位余缺分配规则")
+        for value, name in ((self.gross_amount, "成交总额"), (self.fee_amount, "费用")):
+            if abs(value - round(value, 6)) > 1e-9:
+                raise ValueError(f"{name}必须已是最小货币单位的整数倍")
 
 
 @dataclass(frozen=True)

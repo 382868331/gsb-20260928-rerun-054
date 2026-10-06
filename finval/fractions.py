@@ -38,6 +38,8 @@ from .events import (
     CashPriceFixing,
     ElectionRevocation,
     FractionElection,
+    FractionPool,
+    FractionPoolExecution,
 )
 from .valuation import Valuation
 
@@ -69,6 +71,9 @@ class FractionRecord:
     exact_cash: Optional[float]  # 未舍入精确现金，用于守恒核对
     event_id: Optional[str]
     basis: Optional[str]
+    pool_id: Optional[str] = None
+    fee_amount: Optional[float] = None
+    exact_fee: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -80,6 +85,7 @@ class FractionReport:
     generated: tuple[GeneratedFraction, ...]
     records: tuple[FractionRecord, ...]
     residuals: tuple[float, ...]   # 每笔现金记录的舍入余量（exact - 落账）
+    processed_notification_ids: tuple[str, ...] = ()
 
     @property
     def total_residual(self) -> float:
@@ -99,13 +105,16 @@ class FractionReport:
         for r in self.records:
             bucket = out.setdefault(r.holder, {
                 "pending_units": 0.0, "available_cash": 0.0, "adjustments": 0.0})
-            if r.kind == "PENDING_CASH":
+            if r.kind in ("PENDING_CASH", "POOL_PENDING"):
                 bucket["pending_units"] += r.units
             elif r.kind in ("CASH_IN_LIEU", "PRICE_ADJUSTMENT",
-                            "REVOCATION_ADJUSTMENT"):
+                            "REVOCATION_ADJUSTMENT", "POOL_PROCEEDS",
+                            "POOL_FEE", "POOL_ADJUSTMENT",
+                            "POOL_FEE_ADJUSTMENT", "POOL_REVOCATION_ADJUSTMENT",
+                            "POOL_REVOCATION_FEE_ADJUSTMENT"):
                 if r.cash_amount is not None:
                     bucket["available_cash"] += r.cash_amount
-                    if r.kind != "CASH_IN_LIEU":
+                    if r.kind not in ("CASH_IN_LIEU", "POOL_PROCEEDS", "POOL_FEE"):
                         bucket["adjustments"] += r.cash_amount
         pending_keys = {
             (r.holder, r.unit_change_event_id)
@@ -129,6 +138,32 @@ class FractionReport:
                 out[r.holder] = out.get(r.holder, 0.0) + r.units
         return {h: round(u, 12) for h, u in sorted(out.items())}
 
+    def pool_summary(self) -> dict:
+        """按汇总批次列示成交总额、费用、净现金与来源份额。"""
+        out: dict = {}
+        for record in self.records:
+            if record.pool_id is None:
+                continue
+            pool = out.setdefault(record.pool_id, {})
+            holder = pool.setdefault(record.holder, {
+                "source_units": 0.0, "gross_cash": 0.0,
+                "fee_amount": 0.0, "net_cash": 0.0})
+            if record.kind in ("POOL_PROCEEDS", "POOL_ADJUSTMENT",
+                               "POOL_REVOCATION_ADJUSTMENT"):
+                holder["gross_cash"] += record.cash_amount or 0.0
+            if record.kind in ("POOL_FEE", "POOL_FEE_ADJUSTMENT",
+                               "POOL_REVOCATION_FEE_ADJUSTMENT"):
+                holder["fee_amount"] += record.fee_amount or 0.0
+            if record.kind == "POOL_PROCEEDS":
+                holder["source_units"] += record.units
+        for pool in out.values():
+            for holder in pool.values():
+                holder["net_cash"] = round(
+                    holder["gross_cash"] - holder["fee_amount"], ROUND_DECIMALS)
+                for key in ("source_units", "gross_cash", "fee_amount"):
+                    holder[key] = round(holder[key], ROUND_DECIMALS)
+        return out
+
     def check_conservation(self, tol: float = 1e-6) -> bool:
         """单位与资金双重守恒。
 
@@ -141,10 +176,13 @@ class FractionReport:
         transferred_in = 0.0
         for r in self.records:
             if r.kind in ("RETAINED", "PENDING_CASH", "CASH_IN_LIEU",
-                          "TRANSFER_OUT"):
+                          "TRANSFER_OUT", "POOL_PENDING", "POOL_PROCEEDS"):
                 key = (r.unit_change_event_id, r.holder)
                 disposed[key] = disposed.get(key, 0.0) + r.units
             if r.kind == "REVOCATION_ADJUSTMENT":
+                key = (r.unit_change_event_id, r.holder)
+                disposed[key] = disposed.get(key, 0.0) - r.units
+            if r.kind == "POOL_REVOCATION_ADJUSTMENT":
                 key = (r.unit_change_event_id, r.holder)
                 disposed[key] = disposed.get(key, 0.0) - r.units
             if r.kind == "TRANSFER_OUT":
@@ -194,6 +232,7 @@ def _fraction_report_to_dict(report: FractionReport) -> dict:
         "generated": [asdict(item) for item in report.generated],
         "records": [_record_to_dict(item) for item in report.records],
         "residuals": list(report.residuals),
+        "processed_notification_ids": list(report.processed_notification_ids),
     }
 
 
@@ -204,6 +243,7 @@ def _fraction_report_from_dict(data: dict) -> FractionReport:
         generated=tuple(GeneratedFraction(**item) for item in data["generated"]),
         records=tuple(_record_from_dict(item) for item in data["records"]),
         residuals=tuple(data["residuals"]),
+        processed_notification_ids=tuple(data.get("processed_notification_ids", ())),
     )
 
 
@@ -229,6 +269,166 @@ def _price_chain(events, uc_event_id: str, as_of: date) -> tuple[CashPriceFixing
             raise ValueError(f"定价 {current.event_id} 存在多个更正")
         current = followers[0] if followers else None
     return tuple(chain)
+
+
+def _largest_remainder(weights: dict, total: float) -> tuple[dict, dict]:
+    """按权重分配已为最小货币单位整数倍的总额。
+
+    余缺按精确余数从大到小补/扣一个最小货币单位；余数相同按持有人和来源
+    事件号排序。因此每一分钱都有确定、可复核的归属，不留在未分配桶中。
+    """
+    weight_total = sum(weights.values())
+    if weight_total <= _EPS:
+        return {}, {}
+    scale = 10 ** ROUND_DECIMALS
+    exact = {key: total * weight / weight_total for key, weight in weights.items()}
+    raw = {key: value * scale for key, value in exact.items()}
+    floors = {key: int(math.floor(value + 1e-10)) for key, value in raw.items()}
+    delta_units = int(round(total * scale)) - sum(floors.values())
+    ordered = sorted(raw, key=lambda holder: -(raw[holder] - floors[holder]))
+    if delta_units >= 0:
+        for index in range(delta_units):
+            floors[ordered[index % len(ordered)]] += 1
+    else:
+        for index in range(-delta_units):
+            key = ordered[-(index % len(ordered)) - 1]
+            floors[key] -= 1
+    allocated = {key: value / scale for key, value in floors.items()}
+    return allocated, exact
+
+
+def _settle_fraction_pool(*, pool_id, source, events, as_of, add, add_pool,
+                          removed, records, residuals,
+                          processed_notification_ids):
+    uc_id = source["uc_id"]
+    denom = source["denom"]
+    base_units = dict(source["units"])
+    elections_by_holder = source["election"]
+    executions = sorted(
+        (e for e in events
+         if isinstance(e, FractionPoolExecution)
+         and e.pool_id == pool_id
+         and e.received_date <= as_of),
+        key=lambda e: (e.received_date, e.event_id))
+    if not executions:
+        return
+
+    execution_by_id = {}
+    for execution in executions:
+        previous = execution_by_id.get(execution.event_id)
+        if previous is None or (
+                execution.received_date, execution.event_id) < (
+                previous.received_date, previous.event_id):
+            execution_by_id[execution.event_id] = execution
+    unique_executions = sorted(
+        execution_by_id.values(), key=lambda e: (e.received_date, e.event_id))
+    base_execution = unique_executions[0]
+    known_chain = {base_execution.event_id}
+    for execution in unique_executions[1:]:
+        if execution.corrects_event_id not in known_chain:
+            raise ValueError(
+                f"汇总通知 {execution.event_id} 的更正指向未知通知 "
+                f"{execution.corrects_event_id}")
+        known_chain.add(execution.event_id)
+    processed_notification_ids.append(base_execution.event_id)
+    gross_alloc, exact_gross = _largest_remainder(
+        base_units, base_execution.gross_amount)
+    fee_alloc, exact_fee = _largest_remainder(
+        base_units, base_execution.fee_amount)
+    for holder in sorted(base_units):
+        units = base_units[holder]
+        add_pool(FractionRecord(
+            seq=0, holder=holder, unit_change_event_id=uc_id,
+            kind="POOL_PROCEEDS", units=units, price=None,
+            cash_amount=gross_alloc[holder], exact_cash=exact_gross[holder],
+            event_id=base_execution.event_id, basis=base_execution.basis,
+            pool_id=pool_id))
+        if base_execution.fee_amount > _EPS:
+            add_pool(FractionRecord(
+                seq=0, holder=holder, unit_change_event_id=uc_id,
+                kind="POOL_FEE", units=units, price=None,
+                cash_amount=-fee_alloc[holder], exact_cash=-exact_fee[holder],
+                event_id=base_execution.event_id, basis=base_execution.basis,
+                pool_id=pool_id, fee_amount=fee_alloc[holder],
+                exact_fee=exact_fee[holder]))
+        removed[holder] = removed.get(holder, 0.0) + units / denom
+
+    active_units = dict(base_units)
+    prior_gross = base_execution.gross_amount
+    prior_fee = base_execution.fee_amount
+    election_to_holder = {
+        election.event_id: holder
+        for holder, election in elections_by_holder.items()}
+    handled_revocations = set()
+
+    def post_revocations(cutoff):
+        nonlocal prior_gross, prior_fee
+        revocations = sorted(
+            (e for e in events
+             if isinstance(e, ElectionRevocation)
+             and e.election_event_id in election_to_holder
+             and base_execution.received_date <= e.received_date <= cutoff
+             and e.event_id not in handled_revocations),
+            key=lambda e: (e.received_date, e.event_id))
+        total_base_units = sum(base_units.values())
+        for revocation in revocations:
+            handled_revocations.add(revocation.event_id)
+            holder = election_to_holder[revocation.election_event_id]
+            original_units = base_units.get(holder, 0.0)
+            current = active_units.get(holder, 0.0)
+            revoked_units = min(original_units * revocation.portion, current)
+            if revoked_units <= _EPS:
+                continue
+            active_units[holder] = current - revoked_units
+            add(holder, uc_id, "RETAINED", revoked_units, None, None,
+                revocation.event_id, revocation.basis)
+            gross_clawback = revoked_units * prior_gross / total_base_units
+            fee_refund = revoked_units * prior_fee / total_base_units
+            add_pool(FractionRecord(
+                seq=0, holder=holder, unit_change_event_id=uc_id,
+                kind="POOL_REVOCATION_ADJUSTMENT", units=revoked_units,
+                price=None, cash_amount=round(-gross_clawback, ROUND_DECIMALS),
+                exact_cash=-gross_clawback, event_id=revocation.event_id,
+                    basis=revocation.basis, pool_id=pool_id,
+                    ))
+            if fee_refund > _EPS:
+                add_pool(FractionRecord(
+                    seq=0, holder=holder, unit_change_event_id=uc_id,
+                    kind="POOL_REVOCATION_FEE_ADJUSTMENT", units=revoked_units,
+                    price=None, cash_amount=round(fee_refund, ROUND_DECIMALS),
+                    exact_cash=fee_refund, event_id=revocation.event_id,
+                    basis=revocation.basis, pool_id=pool_id,
+                    fee_amount=round(-fee_refund, ROUND_DECIMALS),
+                    exact_fee=-fee_refund))
+
+    for execution in unique_executions[1:]:
+        post_revocations(execution.received_date)
+        processed_notification_ids.append(execution.event_id)
+        weights = {h: u for h, u in active_units.items() if u > _EPS}
+        delta_gross = execution.gross_amount - prior_gross
+        delta_fee = execution.fee_amount - prior_fee
+        gross_delta, gross_exact = _largest_remainder(weights, delta_gross)
+        fee_delta, fee_exact = _largest_remainder(weights, delta_fee)
+        for holder in sorted(weights):
+            if abs(gross_exact[holder]) > _EPS:
+                add_pool(FractionRecord(
+                    seq=0, holder=holder, unit_change_event_id=uc_id,
+                    kind="POOL_ADJUSTMENT", units=weights[holder], price=None,
+                    cash_amount=gross_delta[holder],
+                    exact_cash=gross_exact[holder], event_id=execution.event_id,
+                    basis=execution.basis, pool_id=pool_id))
+            if abs(fee_exact[holder]) > _EPS:
+                add_pool(FractionRecord(
+                    seq=0, holder=holder, unit_change_event_id=uc_id,
+                    kind="POOL_FEE_ADJUSTMENT", units=weights[holder],
+                    price=None, cash_amount=-fee_delta[holder],
+                    exact_cash=-fee_exact[holder], event_id=execution.event_id,
+                    basis=execution.basis, pool_id=pool_id,
+                    fee_amount=fee_delta[holder], exact_fee=fee_exact[holder]))
+        prior_gross = execution.gross_amount
+        prior_fee = execution.fee_amount
+
+    post_revocations(as_of)
 
 
 def fraction_settlement(valuation: Valuation, as_of: Optional[date] = None) -> FractionReport:
@@ -262,6 +462,8 @@ def fraction_settlement(valuation: Valuation, as_of: Optional[date] = None) -> F
     records: list[FractionRecord] = []
     residuals: list[float] = []
     removed: dict = {}   # holder -> 已折现/转出的原合约权益比例
+    pool_sources: dict = {}
+    processed_notification_ids: list[str] = []
     seq = 0
 
     def add(holder, uc_id, kind, units, price, exact_cash, event_id, basis):
@@ -274,6 +476,13 @@ def fraction_settlement(valuation: Valuation, as_of: Optional[date] = None) -> F
             seq=seq, holder=holder, unit_change_event_id=uc_id, kind=kind,
             units=units, price=price, cash_amount=cash, exact_cash=exact_cash,
             event_id=event_id, basis=basis))
+        seq += 1
+
+    def add_pool(record):
+        nonlocal seq
+        records.append(replace(record, seq=seq))
+        if record.exact_cash is not None:
+            residuals.append(round(record.exact_cash - record.cash_amount, 12))
         seq += 1
 
     for uc in unit_changes:
@@ -294,6 +503,20 @@ def fraction_settlement(valuation: Valuation, as_of: Optional[date] = None) -> F
                 election = None   # 选择截止日早于变化生效日，不适用
             method = election.method if election is not None else "RETAIN"
             ratio_denom = total_units * factor_after
+
+            pool_notice = next(
+                (e for e in events
+                 if isinstance(e, FractionPool)
+                  and e.pool_id == getattr(election, "pool_id", None)
+                  and e.unit_change_event_id == uc.event_id
+                  and e.received_date <= as_of),
+                None)
+
+            if method == "POOL" and (
+                    pool_notice is None
+                    or election.received_date > pool_notice.cutoff_date
+                    or election.effective_date > pool_notice.cutoff_date):
+                method = "RETAIN"
 
             if method == "RETAIN":
                 add(holder, uc.event_id, "RETAINED", frac,
@@ -317,6 +540,42 @@ def fraction_settlement(valuation: Valuation, as_of: Optional[date] = None) -> F
                     None, None, election.event_id, election.basis)
                 add(election.to_holder, uc.event_id, "TRANSFER_IN", elected_frac,
                     None, None, election.event_id, election.basis)
+            elif method == "POOL":
+                executions = sorted(
+                    (e for e in events
+                     if isinstance(e, FractionPoolExecution)
+                     and e.pool_id == pool_notice.pool_id
+                     and e.received_date <= as_of),
+                    key=lambda e: (e.received_date, e.event_id))
+                before_execution = 0.0
+                before_events = []
+                cutoff = executions[0].received_date if executions else as_of
+                before_events = [
+                    e for e in events
+                    if isinstance(e, ElectionRevocation)
+                    and e.election_event_id == election.event_id
+                    and e.received_date < cutoff]
+                before_events.sort(key=lambda e: (e.received_date, e.event_id))
+                for event in before_events:
+                    before_execution = min(1.0, before_execution + event.portion)
+                revoked_before = frac * before_execution
+                active_units = frac - revoked_before
+                if revoked_before > _EPS:
+                    rev_event = sorted(
+                        before_events, key=lambda e: (e.received_date, e.event_id))[-1]
+                    add(holder, uc.event_id, "RETAINED", revoked_before,
+                        None, None, rev_event.event_id, rev_event.basis)
+                if not executions:
+                    if active_units > _EPS:
+                        add(holder, uc.event_id, "POOL_PENDING", active_units,
+                            None, None, election.event_id, election.basis)
+                else:
+                    source = pool_sources.setdefault(pool_notice.pool_id, {
+                        "uc_id": uc.event_id, "notice": pool_notice,
+                        "denom": ratio_denom, "units": {}, "election": {}})
+                    source["units"][holder] = active_units
+                    source["election"][holder] = election
+
             else:  # CASH
                 pending_units = frac
                 cash_units = 0.0
@@ -393,6 +652,20 @@ def fraction_settlement(valuation: Valuation, as_of: Optional[date] = None) -> F
                     removed[holder] = (
                         removed.get(holder, 0.0) + cash_units / ratio_denom)
 
+    for pool_id in sorted(pool_sources):
+        _settle_fraction_pool(
+            pool_id=pool_id,
+            source=pool_sources[pool_id],
+            events=events,
+            as_of=as_of,
+            add=add,
+            add_pool=add_pool,
+            removed=removed,
+            records=records,
+            residuals=residuals,
+            processed_notification_ids=processed_notification_ids,
+        )
+
     return FractionReport(
         contract_id=valuation.contract_id,
         as_of=as_of,
@@ -400,4 +673,5 @@ def fraction_settlement(valuation: Valuation, as_of: Optional[date] = None) -> F
         records=tuple(replace(record, seq=index)
                       for index, record in enumerate(records)),
         residuals=tuple(residuals),
+        processed_notification_ids=tuple(dict.fromkeys(processed_notification_ids)),
     )

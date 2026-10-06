@@ -15,6 +15,8 @@ from finval import (
     FixedRateContract,
     FractionReport,
     FractionElection,
+    FractionPool,
+    FractionPoolExecution,
     Frequency,
     RightsTransfer,
     StubType,
@@ -447,3 +449,155 @@ def test_same_day_ordering_and_deadline():
         run((T_YI, MERGE1, late, price)), as_of=AS_OF)
     assert [r.kind for r in report2.holder_records("乙")] == ["RETAINED"]
     report2.check_conservation()
+
+
+def test_pool_revocation_before_execution_recalculates_participating_units():
+    t_bing = RightsTransfer(
+        event_id="T-BING", to_holder="丙", ratio=1 / 3,
+        effective_date=date(2025, 9, 1), received_date=date(2025, 9, 1),
+        basis="转让协议")
+    pool_notice = FractionPool(
+        event_id="POOL-NOTICE", pool_id="POOL-1", unit_change_event_id="U1",
+        cutoff_date=date(2025, 10, 5), received_date=date(2025, 10, 1),
+        basis="零碎份额合并出售")
+    elections = tuple(
+        FractionElection(
+            event_id=f"E-POOL-{h}", holder=h, unit_change_event_id="U1",
+            method="POOL", pool_id="POOL-1",
+            effective_date=date(2025, 10, 5), received_date=date(2025, 10, 2),
+            basis="参加汇总")
+        for h in ("乙", "丙", "ORIGINAL"))
+    revocation = ElectionRevocation(
+        event_id="R-POOL-BING", election_event_id="E-POOL-丙",
+        portion=0.5, received_date=date(2025, 10, 4), basis="成交前撤回")
+    execution = FractionPoolExecution(
+        event_id="X1", pool_id="POOL-1", gross_amount=1.0, fee_amount=0.1,
+        effective_date=date(2025, 10, 6), received_date=date(2025, 10, 6),
+        basis="成交到账")
+    events = (T_YI, t_bing, MERGE1, pool_notice, *elections, revocation, execution)
+
+    pending = fraction_settlement(run(events), as_of=date(2025, 10, 3))
+    assert pending.processed_notification_ids == ()
+    assert pending.cash_summary()["乙"]["pending_units"] == pytest.approx(1 / 9)
+    pending.check_conservation()
+
+    after_revocation = fraction_settlement(run(events), as_of=date(2025, 10, 5))
+    bing = after_revocation.holder_records("丙")
+    assert [r.kind for r in bing] == ["RETAINED", "POOL_PENDING"]
+    assert sum(r.units for r in bing if r.kind == "RETAINED") == pytest.approx(1 / 18)
+    assert sum(r.units for r in bing if r.kind == "POOL_PENDING") == pytest.approx(1 / 18)
+    after_revocation.check_conservation()
+
+    report = fraction_settlement(run(events), as_of=date(2025, 10, 7))
+    report.check_conservation()
+    assert report.processed_notification_ids == ("X1",)
+    active = {"乙": 1 / 9, "丙": 1 / 18, "ORIGINAL": 1 / 9}
+    proceeds = {r.holder: r.cash_amount
+                for r in report.records if r.kind == "POOL_PROCEEDS"}
+    fees = {r.holder: r.fee_amount
+            for r in report.records if r.kind == "POOL_FEE"}
+    assert sum(proceeds.values()) == pytest.approx(1.0)
+    assert sum(fees.values()) == pytest.approx(0.1)
+    for r in report.records:
+        if r.kind in ("POOL_PROCEEDS", "POOL_FEE"):
+            assert r.pool_id == "POOL-1"
+            assert r.units == pytest.approx(active[r.holder])
+    net = {h: item["available_cash"] for h, item in report.cash_summary().items()}
+    assert sum(net.values()) == pytest.approx(0.9)
+    assert report.retained_units()["丙"] == pytest.approx(1 / 18)
+    summary = report.pool_summary()["POOL-1"]
+    assert sum(item["gross_cash"] for item in summary.values()) == pytest.approx(1.0)
+    assert sum(item["fee_amount"] for item in summary.values()) == pytest.approx(0.1)
+    assert sum(item["net_cash"] for item in summary.values()) == pytest.approx(0.9)
+
+
+def test_pool_execution_then_revocation_and_late_price_correction(tmp_path):
+    t_bing = RightsTransfer(
+        event_id="T-BING", to_holder="丙", ratio=1 / 3,
+        effective_date=date(2025, 9, 1), received_date=date(2025, 9, 1),
+        basis="转让协议")
+    pool_notice = FractionPool(
+        event_id="POOL-NOTICE", pool_id="POOL-1", unit_change_event_id="U1",
+        cutoff_date=date(2025, 10, 5), received_date=date(2025, 10, 1),
+        method="COMPENSATION", basis="指定批次统一补偿")
+    elections = tuple(
+        FractionElection(
+            event_id=f"E-POOL-{h}", holder=h, unit_change_event_id="U1",
+            method="POOL", pool_id="POOL-1",
+            effective_date=date(2025, 10, 5), received_date=date(2025, 10, 2),
+            basis="参加统一补偿")
+        for h in ("乙", "丙", "ORIGINAL"))
+    execution = FractionPoolExecution(
+        event_id="X1", pool_id="POOL-1", gross_amount=1.0, fee_amount=0.1,
+        effective_date=date(2025, 10, 6), received_date=date(2025, 10, 6),
+        basis="首次补偿到账")
+    revocation = ElectionRevocation(
+        event_id="R-POOL-BING", election_event_id="E-POOL-丙",
+        portion=0.5, received_date=date(2025, 10, 7), basis="完成后撤回")
+    duplicate = FractionPoolExecution(
+        event_id="X1", pool_id="POOL-1", gross_amount=1.0, fee_amount=0.1,
+        effective_date=date(2025, 10, 6), received_date=date(2025, 10, 8),
+        basis="重复到账通知")
+    correction = FractionPoolExecution(
+        event_id="X2", pool_id="POOL-1", gross_amount=2.0, fee_amount=0.2,
+        effective_date=date(2025, 10, 9), received_date=date(2025, 10, 9),
+        basis="迟到价格修订", corrects_event_id="X1")
+    events = (T_YI, t_bing, MERGE1, pool_notice, *elections, execution,
+              revocation, duplicate, correction)
+
+    priced = fraction_settlement(run(events), as_of=date(2025, 10, 6))
+    priced.check_conservation()
+    base_total_units = 1 / 3
+    assert priced.retained_units() == {}
+    assert sum(r.cash_amount for r in priced.records
+               if r.kind == "POOL_PROCEEDS") == pytest.approx(1.0)
+    assert sum(r.fee_amount for r in priced.records
+               if r.kind == "POOL_FEE") == pytest.approx(0.1)
+
+    withdrawn = fraction_settlement(run(events), as_of=date(2025, 10, 8))
+    withdrawn.check_conservation()
+    assert withdrawn.processed_notification_ids == ("X1",)
+    original = [r for r in withdrawn.records if r.event_id == "X1"]
+    repeated = [r for r in original if r.holder == "丙" and r.kind == "POOL_PROCEEDS"]
+    assert len(repeated) == 1
+    bing_records = withdrawn.holder_records("丙")
+    assert [r.kind for r in bing_records] == [
+        "POOL_PROCEEDS", "POOL_FEE", "RETAINED",
+        "POOL_REVOCATION_ADJUSTMENT", "POOL_REVOCATION_FEE_ADJUSTMENT"]
+    retained = next(r for r in bing_records if r.kind == "RETAINED")
+    gross_clawback = next(r for r in bing_records
+                          if r.kind == "POOL_REVOCATION_ADJUSTMENT")
+    fee_refund = next(r for r in bing_records
+                      if r.kind == "POOL_REVOCATION_FEE_ADJUSTMENT")
+    assert retained.units == pytest.approx(1 / 18)
+    assert gross_clawback.cash_amount == pytest.approx(round(-1 / 6, 6))
+    assert fee_refund.cash_amount == pytest.approx(round(1 / 60, 6))
+
+    report = fraction_settlement(run(events), as_of=date(2025, 10, 10))
+    report.check_conservation()
+    assert report.processed_notification_ids == ("X1", "X2")
+    original_count = sum(1 for r in report.records if r.event_id == "X1")
+    assert original_count == 6
+    adjustments = [r for r in report.records if r.event_id == "X2"]
+    assert {r.kind for r in adjustments} == {
+        "POOL_ADJUSTMENT", "POOL_FEE_ADJUSTMENT"}
+    assert sum(r.cash_amount for r in adjustments
+               if r.kind == "POOL_ADJUSTMENT") == pytest.approx(1.0)
+    assert sum(r.cash_amount for r in adjustments
+               if r.kind == "POOL_FEE_ADJUSTMENT") == pytest.approx(-0.1)
+    for r in adjustments:
+        if r.holder == "丙":
+            assert r.units == pytest.approx(1 / 18)
+        else:
+            assert r.units == pytest.approx(1 / 9)
+
+    path = tmp_path / "valuation.json"
+    batch = ValuationBatch("B")
+    batch.run(make_contract(events=events), make_curve(AS_OF))
+    batch.save_json(path)
+    restored = fraction_settlement(
+        ValuationBatch.load_json(path).get("FR-1", "C"),
+        as_of=date(2025, 10, 10))
+    restored.check_conservation()
+    assert restored == report
+    assert restored.processed_notification_ids == ("X1", "X2")
