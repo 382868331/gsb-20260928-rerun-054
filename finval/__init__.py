@@ -4,6 +4,11 @@ from .calendar import Calendar, BusinessDayConvention
 from .conventions import DayCount, Frequency, UnsupportedConventionError
 from .contract import FixedRateContract, StubType
 from .events import (
+    AggregationBatch,
+    AggregationElection,
+    AggregationExecution,
+    AggregationPriceRevision,
+    AggregationWithdrawal,
     CashPriceFixing,
     ElectionRevocation,
     FixingCorrection,
@@ -32,6 +37,16 @@ from .fractions import (
     FractionReport,
     GeneratedFraction,
     fraction_settlement,
+)
+from .aggregation import (
+    AggregationRecord,
+    AggregationReport,
+    ProcessComparison,
+    ProcessStep,
+    ResidualAllocation,
+    SubUnitResidual,
+    aggregation_settlement,
+    compare_processes,
 )
 
 __all__ = [
@@ -68,6 +83,19 @@ __all__ = [
     "allocate",
     "holder_positions",
     "unit_factor_at",
+    "AggregationBatch",
+    "AggregationElection",
+    "AggregationExecution",
+    "AggregationPriceRevision",
+    "AggregationWithdrawal",
+    "AggregationRecord",
+    "AggregationReport",
+    "ProcessComparison",
+    "ProcessStep",
+    "ResidualAllocation",
+    "SubUnitResidual",
+    "aggregation_settlement",
+    "compare_processes",
     "FractionRecord",
     "FractionReport",
     "GeneratedFraction",

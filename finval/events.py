@@ -181,3 +181,104 @@ class CashPriceFixing:
     def __post_init__(self) -> None:
         if self.price_per_unit <= 0:
             raise ValueError("现金替代价格必须为正")
+
+
+@dataclass(frozen=True)
+class AggregationBatch:
+    """零碎权益汇总处置批次：同一证券多位持有人的零碎份额统一处理。
+
+    residual_rule 为无法均分最小货币单位时的可复核分配规则：
+    LARGEST_REMAINDER（最大余数优先，并列按持有人名排序）或
+    HOLDER_ORDER（按持有人名字典序）。规则写入报告，可逐笔复核；
+    不足一个最小货币单位的余量单独列示，不默默丢弃也不重复补齐。
+    """
+
+    event_id: str
+    unit_change_event_id: str
+    residual_rule: str
+    received_date: date
+    basis: str
+
+    def __post_init__(self) -> None:
+        if self.residual_rule not in ("LARGEST_REMAINDER", "HOLDER_ORDER"):
+            raise ValueError(f"未知余量分配规则: {self.residual_rule!r}")
+
+
+@dataclass(frozen=True)
+class AggregationElection:
+    """持有人对某汇总批次的选择：RETAIN 各自保留 / SELL 合并出售 /
+    COMPENSATE 按批次统一补偿价补偿。未选择默认 RETAIN。"""
+
+    event_id: str
+    batch_id: str
+    holder: str
+    method: str
+    received_date: date
+    basis: str
+
+    def __post_init__(self) -> None:
+        if self.method not in ("RETAIN", "SELL", "COMPENSATE"):
+            raise ValueError(f"未知汇总处置方式: {self.method!r}")
+
+
+@dataclass(frozen=True)
+class AggregationWithdrawal:
+    """撤回汇总选择（可部分撤回）。
+
+    汇总完成（成交）前撤回：被撤回部分退出参与，可参与数量重新计算；
+    完成后撤回：已收现金不当作未发生，只形成 WITHDRAWAL_ADJUSTMENT
+    追回调整，被撤回单位恢复为保留。
+    """
+
+    event_id: str
+    election_event_id: str
+    portion: float
+    received_date: date
+    basis: str
+
+    def __post_init__(self) -> None:
+        if not 0 < self.portion <= 1:
+            raise ValueError("撤回比例必须在 (0, 1] 区间")
+
+
+@dataclass(frozen=True)
+class AggregationExecution:
+    """汇总批次成交：合并出售价、总费用与统一补偿价。
+
+    total_fee 为出售方承担的总费用，按参与份额比例分摊；
+    compensation_price_per_unit 为 COMPENSATE 参与者的统一补偿单价，
+    无 COMPENSATE 参与者时可为 None。成交即批次完成。
+    """
+
+    event_id: str
+    batch_id: str
+    price_per_unit: float
+    total_fee: float
+    received_date: date
+    basis: str
+    compensation_price_per_unit: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.price_per_unit <= 0:
+            raise ValueError("合并出售单价必须为正")
+        if self.total_fee < 0:
+            raise ValueError("汇总费用不能为负")
+        if (self.compensation_price_per_unit is not None
+                and self.compensation_price_per_unit <= 0):
+            raise ValueError("统一补偿单价必须为正")
+
+
+@dataclass(frozen=True)
+class AggregationPriceRevision:
+    """批次完成后迟到的价格修订：只形成追加 PRICE_ADJUSTMENT 调整，
+    已分配的成交现金记录保持原样，不当作未发生。"""
+
+    event_id: str
+    execution_event_id: str
+    new_price_per_unit: float
+    received_date: date
+    basis: str
+
+    def __post_init__(self) -> None:
+        if self.new_price_per_unit <= 0:
+            raise ValueError("修订价格必须为正")

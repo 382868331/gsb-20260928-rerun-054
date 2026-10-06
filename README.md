@@ -28,6 +28,10 @@
 - **舍入归属**：每个持有人份额独立舍入到最小可分单位（6 位小数），未分配余量在 `contract_view()` 的 `unallocated_residual` 单列，不与任何持有人份额混同。
 - **零碎权益选择**：单位拆并产生零碎单位时，`FractionElection` 支持 `RETAIN` 保留可累积 / `CASH` 现金替代 / `TRANSFER` 转给另一持有人；`fraction_settlement()` 生成 `FractionReport`，内部一律用未舍入精确值计算，落账现金才舍入，余量逐笔记录并汇总于 `total_residual` 供核对。
 - **待定与可用现金**：现金替代价格（`CashPriceFixing`）可晚于份额变化到达；定价前为 `PENDING_CASH` 待定权益，定价后生成 `CASH_IN_LIEU` 可用现金；价格更正只追加 `PRICE_ADJUSTMENT`，选择撤回（`ElectionRevocation`，可部分）只追加 `REVOCATION_ADJUSTMENT`，已完成的分配记录不改写。
+- **零碎权益汇总处置**：`AggregationBatch` 把同一证券多位持有人的零碎份额汇总处理；`AggregationElection` 各自选择 `RETAIN` 保留 / `SELL` 合并出售 / `COMPENSATE` 按批次统一补偿价补偿；成交现金与费用按实际参与份额（精确未舍入单位）比例分配，每位持有人的权益来源逐笔可查。
+- **最小货币单位余量规则**：无法均分的最小货币单位按批次指定的可复核规则分配（`LARGEST_REMAINDER` 最大余数 / `HOLDER_ORDER` 持有人序），每次分配记录于 `residual_allocations`；不足一个最小单位的余量单列于 `sub_unit_residuals`，不默默丢弃也不重复补齐。
+- **撤回与迟到修订**：成交前 `AggregationWithdrawal`（可部分）重新计算可参与数量；成交后撤回只追加 `WITHDRAWAL_ADJUSTMENT` 追回调整，迟到的 `AggregationPriceRevision` 只追加 `PRICE_ADJUSTMENT`，已收现金不当作未发生。
+- **过程比较**：`compare_processes()` 对照“先撤回后定价”与“先定价后撤回”两种过程，逐步核对剩余份额、累计现金与费用守恒（`ProcessComparison.check_conservation`）。
 - **分配对账**：`allocate()` 生成 `AllocationReport`，提供原合约视角（`contract_view`）与各持有人视角（`holder_view` / `totals_by_holder`），`check_conservation()` 校验总额守恒；报告可 `save_json` / `load_json`，重开后各方已收/应收/补偿互不覆盖。
 - **存档重开**：`ValuationBatch.save_json()` / `load_json()` 保存当前日程、原始日程快照、历史结论、解释与事件依据。
 
@@ -219,6 +223,50 @@ print(report.total_residual)         # 舍入余量总和，可逐笔核对
 - 同日事件按 `(effective_date, received_date, event_id)` 确定生效顺序；选择截止日不早于单位变化生效日（含同日）才适用，未选择默认 `RETAIN`。
 - 价格未知期间 `cash_summary()` 的 `pending_units` 与 `available_cash` 严格区分；价格更正用 `CashPriceFixing(corrects_event_id=...)` 链接，只产生 `PRICE_ADJUSTMENT`。
 - `ElectionRevocation(portion=0.5)` 部分撤回：被撤回部分恢复保留累积，已分配现金以 `REVOCATION_ADJUSTMENT` 追回，原 `CASH_IN_LIEU` 记录不变。
+
+### 零碎权益汇总处置
+
+```python
+from finval import (
+    AggregationBatch, AggregationElection, AggregationExecution,
+    AggregationPriceRevision, AggregationWithdrawal,
+    aggregation_settlement, compare_processes,
+)
+
+agg_batch = AggregationBatch(event_id="B1", unit_change_event_id="U1",
+                              residual_rule="LARGEST_REMAINDER",   # 余量可复核规则
+                              received_date=date(2025, 10, 2), basis="汇总处置批次")
+elections = (
+    AggregationElection(event_id="E-YI", batch_id="B1", holder="乙",
+                        method="SELL",                      # 合并出售
+                        received_date=date(2025, 10, 3), basis="出售选择"),
+    AggregationElection(event_id="E-BING", batch_id="B1", holder="丙",
+                        method="COMPENSATE",                # 按批次统一补偿
+                        received_date=date(2025, 10, 3), basis="补偿选择"),
+)
+execution = AggregationExecution(
+    event_id="X1", batch_id="B1", price_per_unit=0.1, total_fee=0.07,
+    compensation_price_per_unit=0.09,       # COMPENSATE 统一补偿价
+    received_date=date(2025, 10, 10), basis="成交确认")
+contract = replace(contract,
+                   events=contract.events + (agg_batch,) + elections + (execution,))
+valuation = batch.run(contract, curve)
+
+report = aggregation_settlement(valuation, as_of=date(2025, 12, 1))
+report.check_conservation()                # 精确 = 落账 + 余量分配 + 次单位余量
+print(report.cash_summary())               # 各持有人 保留单位/成交单位/净现金/费用/调整
+print(report.residual_allocations)         # 最小货币单位分给了谁，逐笔可复核
+report.save_json("aggregation.json")       # 重开后继续处理同一批次
+
+# 两种过程对照：先撤回后定价 vs 先定价后撤回
+comparison = compare_processes(valuation, "B1", as_of=date(2025, 12, 1))
+for step in comparison.withdraw_first:
+    print(step.label, step.remaining_units, step.cumulative_cash, step.cumulative_fee)
+```
+
+- 成交前撤回（`AggregationWithdrawal(portion=...)`）重新计算可参与数量；成交后撤回只形成 `WITHDRAWAL_ADJUSTMENT` 追回记录，被撤回单位恢复保留。
+- 迟到价格修订（`AggregationPriceRevision`）只追加 `PRICE_ADJUSTMENT`，原 `PROCEEDS` 记录不变；同一 `event_id` 的重复通知记入 `duplicates_ignored`，不会再次分配。
+- `AggregationReport.save_json/load_json` 存档重开；用更晚 `as_of` 重跑时既有记录保持前缀不变，迟到事件只追加。
 
 ## 测试
 
